@@ -4,6 +4,26 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.1] - 2026-05-17
+
+### Added — File I/O
+- **Excel (.xlsx) read/write**: `File → Open / Save As` auto-detects `.xlsx`
+  / `.xlsm` (read also handles `.xlsm`). Formulas are preserved on both
+  sides — re-evaluated on open, re-emitted on save. Multi-sheet workbooks
+  load only the first sheet with a status-bar warning. Column widths
+  round-trip.
+- **Cached-value fallback**: imported cells now carry an optional
+  `cached_value` (Excel's last-computed result). If tbla's engine can't
+  evaluate the formula — e.g. an unsupported Excel function like `BITAND`
+  — display and aggregation fall back to the cached value. Editing the
+  cell clears the override.
+- New deps: `calamine = "0.30"` (read), `rust_xlsxwriter = "0.92"` (write).
+
+### Changed
+- **Selection background color** brightened from `RGB(60,60,120)`
+  (low-contrast muted purple) to `RGB(60,110,200)` (clear blue) for
+  better readability on dark terminal backgrounds.
+
 ## [0.2.0] - 2026-05-17
 
 ### Added — 44 new formula functions
@@ -25,6 +45,12 @@ this project adheres to [Semantic Versioning](https://semver.org/).
 - **Random / multiples (5)**: `RAND`, `RANDBETWEEN`, `GCD`, `LCM`, `FACT`.
 
 ### Added — UX
+- **Print via HTML export**: `Ctrl+P` (or File → 印刷 (HTML)...) writes
+  a print-friendly HTML file with the current sheet (column letters /
+  row numbers as table headers that repeat on every printed page,
+  right-aligned numerics, errors in red) and opens it in the default
+  browser via `open` / `xdg-open` / `start`. Browser's Cmd/Ctrl+P
+  dialog handles margins, scaling, PDF output, etc.
 - **Mouse column-width resize**: drag the `│` separator in the column
   header to resize. macOS Terminal.app users must hold ⌥ (Option) — see
   README for the Terminal.app input quirks.

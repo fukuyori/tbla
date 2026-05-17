@@ -58,6 +58,12 @@ pub struct Cell {
     pub value: CellValue,
     pub raw_input: String,
     pub format: DisplayFormat,
+    /// Optional fallback value used when this cell's formula can't be
+    /// evaluated by tbla's engine (e.g., an unsupported function imported
+    /// from Excel). Cleared whenever the user edits the cell. Stored as a
+    /// CellValue so SUM/aggregates can still use it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_value: Option<CellValue>,
 }
 
 impl Default for Cell {
@@ -66,6 +72,7 @@ impl Default for Cell {
             value: CellValue::Empty,
             raw_input: String::new(),
             format: DisplayFormat::General,
+            cached_value: None,
         }
     }
 }
@@ -76,7 +83,13 @@ impl Cell {
             value,
             raw_input: input,
             format: DisplayFormat::General,
+            cached_value: None,
         }
+    }
+
+    pub fn with_cached(mut self, cached: Option<CellValue>) -> Self {
+        self.cached_value = cached;
+        self
     }
 
     pub fn is_empty(&self) -> bool {

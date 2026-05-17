@@ -21,7 +21,7 @@ const MENU_BG: Color = Color::Rgb { r: 220, g: 220, b: 220 };
 const MENU_FG: Color = Color::Black;
 const MENU_SEL_BG: Color = Color::Rgb { r: 0, g: 100, b: 200 };
 const MENU_SEL_FG: Color = Color::White;
-const SELECTION_BG: Color = Color::Rgb { r: 60, g: 60, b: 120 };
+const SELECTION_BG: Color = Color::Rgb { r: 60, g: 110, b: 200 };
 // Point mode (Excel-style formula reference selection) highlight
 const POINT_CURSOR_BG: Color = Color::Rgb { r: 80, g: 150, b: 255 };
 const POINT_RANGE_BG: Color = Color::Rgb { r: 40, g: 80, b: 160 };

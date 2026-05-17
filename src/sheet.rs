@@ -56,7 +56,20 @@ impl Sheet {
             self.cells.remove(&(col, row));
         } else {
             let value = cell::parse_input(&input);
+            // User edits replace any imported cached value.
             self.cells.insert((col, row), Cell::new(input, value));
+        }
+    }
+
+    /// Set a cell while preserving (or supplying) a cached value. Used by
+    /// the xlsx importer to keep Excel's computed result as a fallback when
+    /// tbla's engine can't evaluate the imported formula.
+    pub fn set_cell_with_cache(&mut self, col: usize, row: usize, input: String, cached: Option<CellValue>) {
+        if input.trim().is_empty() && cached.is_none() {
+            self.cells.remove(&(col, row));
+        } else {
+            let value = cell::parse_input(&input);
+            self.cells.insert((col, row), Cell::new(input, value).with_cached(cached));
         }
     }
 
@@ -78,16 +91,20 @@ impl Sheet {
             CellValue::Error(e) => e.to_string().to_string(),
             CellValue::Formula(f) => {
                 let mut engine = Engine::new(&self.cells);
-                match engine.evaluate_formula(f) {
-                    Ok(result) => match result {
-                        CellValue::Number(n) => cell.format_number(n),
-                        CellValue::Text(s) => s,
-                        CellValue::Boolean(b) => if b { "TRUE" } else { "FALSE" }.to_string(),
-                        CellValue::Error(e) => e.to_string().to_string(),
-                        CellValue::Empty => String::new(),
-                        CellValue::Formula(_) => "ERR".to_string(),
-                    },
-                    Err(e) => e,
+                let formatted = |v: CellValue| match v {
+                    CellValue::Number(n) => cell.format_number(n),
+                    CellValue::Text(s) => s,
+                    CellValue::Boolean(b) => if b { "TRUE" } else { "FALSE" }.to_string(),
+                    CellValue::Error(e) => e.to_string().to_string(),
+                    CellValue::Empty => String::new(),
+                    CellValue::Formula(_) => "ERR".to_string(),
+                };
+                match (engine.evaluate_formula(f), &cell.cached_value) {
+                    (Ok(result), _) => formatted(result),
+                    // Fallback to imported value when our engine can't handle
+                    // the formula (e.g. unsupported function from Excel).
+                    (Err(_), Some(cached)) => formatted(cached.clone()),
+                    (Err(e), None) => e,
                 }
             }
         }

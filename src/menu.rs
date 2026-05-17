@@ -9,6 +9,7 @@ pub enum Action {
     FileSaveAs,
     FileImportCsv,
     FileExportCsv,
+    FilePrintHtml,
     FileQuit,
 
     EditUndo,
@@ -114,6 +115,13 @@ impl MenuBar {
                         mnemonic: Some('E'),
                         shortcut: None,
                         action: Action::FileExportCsv,
+                    },
+                    SubItem::Separator,
+                    SubItem::Item {
+                        label: "印刷 (HTML)...".to_string(),
+                        mnemonic: Some('P'),
+                        shortcut: Some("Ctrl+P"),
+                        action: Action::FilePrintHtml,
                     },
                     SubItem::Separator,
                     SubItem::Item {

@@ -28,7 +28,7 @@ menu bar at the top of the screen for file and edit operations.
 - **Formula adjustment** — References auto-update on row/column insert/delete
 - **Copy & paste** — Ctrl+C / Ctrl+X / Ctrl+V (also writes to system clipboard)
 - **Undo/Redo** — Ctrl+Z / Ctrl+Y
-- **File formats** — JSON (native), CSV/TSV import/export
+- **File formats** — JSON (native), CSV/TSV, **Excel (.xlsx) read/write**
 - **Unicode / IME support** — Proper handling of CJK characters and IME composition
 
 ## Installation
@@ -68,49 +68,17 @@ tbla data.csv
 | Key | Action |
 |-----|--------|
 | `↑` `↓` `←` `→` | Move cursor |
-| `Ctrl+H` / `Ctrl+J` / `Ctrl+K` / `Ctrl+L` | Left / Down / Up / Right (home-row navigation) |
-| `Ctrl+Shift+H/J/K/L` | Same, extending the selection |
 | `Tab` / `Shift+Tab` | Move right / left |
 | `Enter` / `Shift+Enter` | Move down / up |
-
-### macOS without dedicated Home/End keys
-
-On Mac keyboards that lack Home/End, use **`Fn+arrow`** — the OS converts
-these to Home/End/PgUp/PgDn at the keyboard level, so no extra setup is
-needed.
-
-| Press | Sent as | Action |
-|-------|---------|--------|
-| `Fn+←` | Home | Beginning of row |
-| `Fn+→` | End | End of row (last data column) |
-| `Fn+↑` | PgUp | Page up |
-| `Fn+↓` | PgDn | Page down |
-
-For A1 / last data cell, use `Ctrl+Home` / `Ctrl+End` (i.e. `Fn+Ctrl+←` /
-`Fn+Ctrl+→` on Mac).
-
-### `Shift+↑/↓` not working in macOS Terminal.app
-
-The default Terminal.app profile drops the SHIFT modifier on `Shift+↑` /
-`Shift+↓`, so vertical range extension via Shift+Arrow doesn't reach the
-application (left/right work fine). Pick one workaround:
-
-- **Alternate keys**: `Ctrl+Shift+K` (extend up) / `Ctrl+Shift+J` (extend down)
-- **Patch Terminal.app**: Settings → Profiles → *your profile* → Keyboard tab,
-  add via `+`:
-  - Key `↑`, Modifier `Shift`, Action `Send Text`, Value `\033[1;2A`
-  - Key `↓`, Modifier `Shift`, Action `Send Text`, Value `\033[1;2B`
-- **Use a different terminal**: iTerm2 / WezTerm / Alacritty / kitty all
-  handle `Shift+Arrow` correctly out of the box.
-
-| `Home` | Beginning of row |
-| `End` | Last cell with data in row |
+| `Home` / `End` | Beginning / end of row (last cell with data) |
+| `Page Up` / `Page Down` | One page up / down |
 | `Ctrl+Home` | Go to A1 |
-| `Ctrl+End` | Last cell with data |
+| `Ctrl+End` | Go to the last cell with data |
 | `Ctrl+↑` `↓` `←` `→` | Jump to next data edge |
-| `Page Up` / `Page Down` | Scroll one page |
 | `Shift+arrow` | Extend selection |
 | `Ctrl+A` | Select all |
+| `Ctrl+H` / `Ctrl+J` / `Ctrl+K` / `Ctrl+L` | Left / Down / Up / Right (vim-style home-row) |
+| `Ctrl+Shift+H/J/K/L` | Same, extending the selection |
 
 ### Editing
 
@@ -123,10 +91,6 @@ application (left/right work fine). Pick one workaround:
 | `↑` / `↓` | Commit and move up/down |
 | `Esc` | Cancel edit |
 | `Delete` / `Backspace` | Clear cell/selection (normal) or delete char (editing) |
-
-> On macOS Terminal.app and iTerm, `F1`–`F12` are often captured by the OS as
-> media keys. Press `Fn+F2`, change the terminal's function-key setting, or
-> double-click a cell instead.
 
 ### Text cursor inside the edit buffer
 
@@ -219,16 +183,60 @@ range in darker blue).
 | Left click on cell | Move cursor |
 | Drag from cell | Range selection |
 | Mouse wheel | Scroll up/down |
-| Right click | Context menu (cut/copy/paste/insert/delete) |
+| Right click | Context menu (cut/copy/paste/insert/delete/column width) |
 | Click on menu bar | Open that menu |
 | Drag the `│` separator in the column header | Resize column width (in macOS Terminal.app hold ⌥ while dragging) |
 
+## Platform notes
+
+### macOS — Macs without Home/End/PgUp/PgDn keys
+
+On a Magic Keyboard etc., use **`Fn+arrow`**. The OS converts these to the
+standard keys before tbla sees them — no extra setup.
+
+| Press | Sent as | Action |
+|-------|---------|--------|
+| `Fn+←` | Home | Beginning of row |
+| `Fn+→` | End | End of row |
+| `Fn+↑` | PgUp | Page up |
+| `Fn+↓` | PgDn | Page down |
+| `Fn+Ctrl+←` | Ctrl+Home | A1 |
+| `Fn+Ctrl+→` | Ctrl+End | Last data cell |
+
+### macOS — Terminal.app input quirks
+
+The default macOS Terminal.app has two known limitations (iTerm2 / WezTerm
+/ Alacritty / kitty all work fine).
+
+**1. `Shift+↑/↓` drops the SHIFT modifier** (left/right work)
+
+Vertical Shift-arrow selection won't extend. Pick one workaround:
+
+- **Alternate keys**: `Ctrl+Shift+K` (extend up) / `Ctrl+Shift+J` (extend down)
+- **Patch Terminal.app**: Settings → Profiles → Keyboard, click `+`
+  - Key `↑`, Modifier `Shift`, Action `Send Text`, Value `\033[1;2A`
+  - Key `↓`, Modifier `Shift`, Action `Send Text`, Value `\033[1;2B`
+- **Switch terminal** — anything modern works.
+
+**2. Mouse clicks / drags don't reach the application** (only Moved arrives)
+
+Terminal.app intercepts mouse buttons for its own text selection. Hold
+**⌥ (Option)** while clicking / dragging to force the events through —
+required for column-width drag, range-drag-selection, etc.
+
+### macOS — `F1`–`F12` are media keys
+
+If `F2` (start editing) doesn't work, your function keys are being eaten
+by the OS as media keys. Either press **`Fn+F2`**, enable System Settings
+→ Keyboard → "Use F1, F2, etc. keys as standard function keys", or just
+double-click the cell to start editing.
+
 ## Menu Bar
 
-- **File**: New, Open, Save, Save As, CSV Import/Export, Quit
+- **File**: New, Open, Save, Save As, CSV Import/Export, Print (HTML), Quit
 - **Edit**: Undo, Redo, Cut, Copy, Paste, Clear, Select All, Find, Find Next, Go To
 - **Insert**: Insert Row/Column, Delete Row/Column
-- **Format**: Auto-fit column width, Widen column, Narrow column
+- **Format**: Auto-fit column width, Widen / Narrow column, Set width (numeric input)
 - **Help**: Key reference, About
 
 ## Supported Functions
@@ -280,6 +288,25 @@ years → `=PMT(0.05/12, 360, 100000)` ≈ -536.82.
 
 ### Information
 `ISBLANK`, `ISNUMBER`, `ISTEXT`
+
+## Printing
+
+tbla doesn't print directly from the terminal — instead it **exports a
+print-friendly HTML file and opens it in your default browser**. You then
+use the browser's print dialog (Cmd/Ctrl+P) for margins, page numbers, PDF
+output, scaling, and so on.
+
+- `Ctrl+P` or `File` → `Print (HTML)...`
+- Enter the output filename (defaults to `<sheet>.html`) → Enter
+- The file opens automatically in your default browser (macOS `open`,
+  Linux `xdg-open`, Windows `start`)
+- If auto-open isn't available on your system, just drop the generated
+  HTML onto a browser window
+
+Styling:
+- Column letters (A, B, C…) and row numbers repeat on every printed page
+- Numbers right-aligned, text left-aligned, errors in red
+- Inline CSS — no external dependencies, works offline
 
 ## Calculation Conventions
 
@@ -347,6 +374,28 @@ tbla uses JSON as its native format, storing:
 - Import via File → CSV Import (or `Alt+F`, `I`)
 - Export via File → CSV Export (or `Alt+F`, `E`)
 - System clipboard uses TSV format
+
+### Excel (.xlsx)
+
+`File → Open / Save As` auto-detects `.xlsx` / `.xlsm` and reads / writes
+in Excel format.
+
+**Read**:
+- Cell values (string / number / boolean / error)
+- Formulas (e.g. `=SUM(...)` preserved and re-evaluated by tbla's engine)
+- Multi-sheet workbooks: **only the first sheet** is loaded; the names of
+  the others are surfaced as a status-bar warning
+
+**Write**:
+- Values and formulas (formulas written as `=SUM(...)` so Excel recalculates
+  on open)
+- Column widths
+- tbla's last computed value is embedded as the cached result, so viewers
+  that don't recompute still see the right number
+
+**Fallback**: formulas using Excel functions tbla doesn't implement
+(e.g. `BITAND`) keep working — Excel's last-saved value is used for display
+and aggregation. Editing the cell clears the override.
 
 ## License
 

@@ -40,7 +40,14 @@ impl<'a> Engine<'a> {
                     self.eval_stack.insert((col, row));
                     let result = self.evaluate_formula(f);
                     self.eval_stack.remove(&(col, row));
-                    result
+                    // If evaluation errors (e.g. unsupported function imported
+                    // from Excel) and the cell has a cached value from import,
+                    // fall back to that so aggregates still work.
+                    match (result, &cell.cached_value) {
+                        (Ok(v), _) => Ok(v),
+                        (Err(_), Some(cached)) => Ok(cached.clone()),
+                        (Err(e), None) => Err(e),
+                    }
                 }
             }
         }

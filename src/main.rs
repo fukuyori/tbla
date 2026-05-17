@@ -6,6 +6,7 @@ mod sheet;
 mod ui;
 mod commands;
 mod menu;
+mod xlsx;
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -46,6 +47,7 @@ pub enum DialogKind {
     /// the intended target — but currently we just read cursor_col on
     /// commit, since the cursor doesn't move while the dialog is open).
     SetColWidth,
+    PrintHtml,
 }
 
 #[derive(Clone, Debug)]
@@ -740,6 +742,22 @@ impl App {
                 });
                 self.mode = Mode::Dialog;
             }
+            Action::FilePrintHtml => {
+                let default_name = match &self.current_file {
+                    Some(path) => {
+                        let stem = std::path::Path::new(path).file_stem()
+                            .and_then(|s| s.to_str()).unwrap_or("sheet");
+                        format!("{}.html", stem)
+                    }
+                    None => "sheet.html".to_string(),
+                };
+                self.dialog = Some(Dialog {
+                    kind: DialogKind::PrintHtml,
+                    label: "出力先 HTML (保存後ブラウザで開きます)".to_string(),
+                    input: default_name,
+                });
+                self.mode = Mode::Dialog;
+            }
             Action::FileQuit => {
                 self.running = false;
             }
@@ -894,6 +912,11 @@ impl App {
                     Err(_) => {
                         self.status_message = "無効な数値です".to_string();
                     }
+                }
+            }
+            DialogKind::PrintHtml => {
+                if !input.is_empty() {
+                    commands::export_html_file(self, &input);
                 }
             }
         }
@@ -1136,6 +1159,7 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             KeyCode::Char('o') | KeyCode::Char('O') => { app.dispatch(Action::FileOpen); return; }
             KeyCode::Char('n') | KeyCode::Char('N') => { app.dispatch(Action::FileNew); return; }
             KeyCode::Char('q') | KeyCode::Char('Q') => { app.dispatch(Action::FileQuit); return; }
+            KeyCode::Char('p') | KeyCode::Char('P') => { app.dispatch(Action::FilePrintHtml); return; }
             KeyCode::Char('f') | KeyCode::Char('F') => { app.dispatch(Action::EditFind); return; }
             KeyCode::Char('g') | KeyCode::Char('G') => { app.dispatch(Action::EditGoto); return; }
             KeyCode::Char('a') | KeyCode::Char('A') => { app.dispatch(Action::EditSelectAll); return; }

@@ -73,6 +73,45 @@ pub fn export_csv_file(app: &mut App, filename: &str) {
     }
 }
 
+/// Export the current sheet as a print-friendly HTML file and try to open
+/// it in the user's default browser. On success the status message reports
+/// whether the browser launch succeeded; the file is always written.
+pub fn export_html_file(app: &mut App, filename: &str) {
+    match export_html(app, filename) {
+        Ok(()) => {
+            let opened = open_in_browser(filename);
+            app.status_message = if opened {
+                format!("{} を出力してブラウザで開きました（Cmd/Ctrl+P で印刷）", filename)
+            } else {
+                format!("{} を出力しました（ブラウザで開いて Cmd/Ctrl+P で印刷）", filename)
+            };
+        }
+        Err(e) => {
+            app.status_message = format!("HTML エクスポートエラー: {}", e);
+        }
+    }
+}
+
+fn open_in_browser(path: &str) -> bool {
+    use std::process::{Command, Stdio};
+    let abs = std::fs::canonicalize(path).map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string());
+    let cmd = if cfg!(target_os = "macos") {
+        Some(("open", vec![abs]))
+    } else if cfg!(target_os = "windows") {
+        Some(("cmd", vec!["/C".to_string(), "start".to_string(), "".to_string(), abs]))
+    } else if cfg!(unix) {
+        Some(("xdg-open", vec![abs]))
+    } else {
+        None
+    };
+    if let Some((bin, args)) = cmd {
+        Command::new(bin).args(args)
+            .stdout(Stdio::null()).stderr(Stdio::null())
+            .spawn().is_ok()
+    } else { false }
+}
+
 /// Auto-adjust all columns with data.
 pub fn autowidth_all(app: &mut App) {
     const MIN_WIDTH: usize = 4;
@@ -215,8 +254,12 @@ fn save_file(app: &App, filename: &str) -> Result<String, String> {
         .unwrap_or_default();
 
     match ext.as_str() {
-        "csv" => {
+        "csv" | "tsv" => {
             export_csv(app, &filename).map_err(|e| e.to_string())?;
+            Ok(filename)
+        }
+        "xlsx" => {
+            crate::xlsx::write_xlsx(&app.sheet, &filename)?;
             Ok(filename)
         }
         _ => {
@@ -234,7 +277,16 @@ fn load_file(app: &mut App, filename: &str) -> Result<(), String> {
         .unwrap_or_default();
 
     match ext.as_str() {
-        "csv" => import_csv(app, filename).map_err(|e| e.to_string()),
+        "csv" | "tsv" => import_csv(app, filename).map_err(|e| e.to_string()),
+        "xlsx" | "xlsm" => {
+            let result = crate::xlsx::read_xlsx(filename)?;
+            app.save_undo();
+            app.sheet = result.sheet;
+            if let Some(w) = result.warning {
+                app.status_message = w;
+            }
+            Ok(())
+        }
         _ => load_json(app, filename).map_err(|e| e.to_string()),
     }
 }
@@ -342,6 +394,78 @@ fn export_csv(app: &App, filename: &str) -> std::io::Result<()> {
     let mut file = fs::File::create(filename)?;
     file.write_all(csv.as_bytes())?;
     Ok(())
+}
+
+fn export_html(app: &App, filename: &str) -> std::io::Result<()> {
+    let max_col = app.sheet.max_col().unwrap_or(0);
+    let max_row = app.sheet.max_row().unwrap_or(0);
+
+    let title = app.current_file.as_deref().unwrap_or("Sheet");
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html>\n<html lang=\"ja\"><head><meta charset=\"utf-8\">\n");
+    html.push_str(&format!("<title>{}</title>\n", html_escape(title)));
+    html.push_str(r#"<style>
+:root { color-scheme: light; }
+body { font-family: -apple-system, "Helvetica Neue", "Hiragino Sans", "Yu Gothic", sans-serif; margin: 1em; color: #111; }
+h1 { font-size: 1.1em; font-weight: normal; margin: 0 0 .6em; color: #444; }
+table { border-collapse: collapse; font-size: 12px; }
+th, td { border: 1px solid #888; padding: 2px 6px; vertical-align: top; white-space: nowrap; }
+thead th, th.rh { background: #f0f0f0; font-weight: 600; text-align: center; color: #333; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+td.txt { text-align: left; }
+td.err { color: #b00; }
+@media print {
+  body { margin: 0.5cm; }
+  thead { display: table-header-group; }   /* repeat header on each page */
+  tr { page-break-inside: avoid; }
+  table { font-size: 10px; }
+}
+</style></head><body>
+"#);
+    html.push_str(&format!("<h1>{}</h1>\n", html_escape(title)));
+    html.push_str("<table><thead><tr><th class=\"rh\"></th>");
+    for col in 0..=max_col {
+        html.push_str(&format!("<th>{}</th>", crate::formula::col_to_name(col)));
+    }
+    html.push_str("</tr></thead><tbody>\n");
+
+    for row in 0..=max_row {
+        html.push_str(&format!("<tr><th class=\"rh\">{}</th>", row + 1));
+        for col in 0..=max_col {
+            let value = app.sheet.evaluate(col, row);
+            let cell = app.sheet.get_cell_ref(col, row);
+            let class = match cell.map(|c| &c.value) {
+                Some(CellValue::Number(_)) | Some(CellValue::Formula(_)) => {
+                    // Right-align if it evaluated to a numeric string.
+                    if value.parse::<f64>().is_ok() { "num" } else { "txt" }
+                }
+                Some(CellValue::Error(_)) => "err",
+                _ => "txt",
+            };
+            html.push_str(&format!("<td class=\"{}\">{}</td>", class, html_escape(&value)));
+        }
+        html.push_str("</tr>\n");
+    }
+    html.push_str("</tbody></table>\n</body></html>\n");
+
+    let mut file = fs::File::create(filename)?;
+    file.write_all(html.as_bytes())?;
+    Ok(())
+}
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
 }
 
 fn import_csv(app: &mut App, filename: &str) -> std::io::Result<()> {
