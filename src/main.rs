@@ -861,21 +861,25 @@ impl App {
 
         match dialog.kind {
             DialogKind::Open => {
+                let input = commands::sanitize_path_input(&input);
                 if !input.is_empty() {
                     commands::load_from_file(self, &input);
                 }
             }
             DialogKind::SaveAs => {
+                let input = commands::sanitize_path_input(&input);
                 if !input.is_empty() {
                     commands::save_to_file(self, &input);
                 }
             }
             DialogKind::ImportCsv => {
+                let input = commands::sanitize_path_input(&input);
                 if !input.is_empty() {
                     commands::import_csv_file(self, &input);
                 }
             }
             DialogKind::ExportCsv => {
+                let input = commands::sanitize_path_input(&input);
                 if !input.is_empty() {
                     commands::export_csv_file(self, &input);
                 }
@@ -915,6 +919,7 @@ impl App {
                 }
             }
             DialogKind::PrintHtml => {
+                let input = commands::sanitize_path_input(&input);
                 if !input.is_empty() {
                     commands::export_html_file(self, &input);
                 }
@@ -1787,8 +1792,8 @@ fn main() -> Result<()> {
     let mut app = App::new();
 
     if args.len() > 1 {
-        let filename = &args[1];
-        commands::load_from_file(&mut app, filename);
+        let filename = commands::sanitize_path_input(&args[1]);
+        commands::load_from_file(&mut app, &filename);
     }
 
     UI::draw(&app)?;

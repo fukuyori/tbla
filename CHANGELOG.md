@@ -4,6 +4,47 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-05-17
+
+### Fixed
+- **Opening file paths with surrounding quotes** (Windows): paths pasted
+  from Explorer's "Copy as path" (which wraps in `"…"`) no longer fail with
+  `os error 123 / ERROR_INVALID_NAME`. Dialog input and the CLI argument
+  now strip a single matching pair of `"` or `'` via the new
+  `commands::sanitize_path_input` helper. A clearer hint is appended to
+  the status message when the OS returns `os error 123`.
+- **Status bar wrapping**: long file paths in the right-hand status
+  segment are now shown as basename only, and the whole line is hard-
+  clipped to terminal width — so absolute paths no longer wrap to a
+  second line and cause flicker.
+- **Color leak in grid (introduced by the cache changes below)**: the row
+  label was changing terminal colors via raw `queue!` calls, bypassing
+  the new color cache and causing the green row-label background to bleed
+  into the adjacent cells on the cursor row. All grid color writes now
+  go through the cache helpers.
+
+### Changed — flicker reduction
+- **Synchronized output (DEC mode 2026)**: each frame is wrapped in
+  `\x1b[?2026h` / `\x1b[?2026l` so modern terminals (Windows Terminal,
+  WezTerm, kitty, iTerm2, Alacritty 0.13+, Ghostty) present the buffered
+  frame atomically. Inside `tmux`, the sequence is DCS-wrapped
+  (`\ePtmux;\e…\e\\`) so it passes through to the host terminal.
+  `$WTMUX` is detected and the sequence is skipped (wtmux runs on ConPTY
+  and does not understand mode 2026).
+- **Cursor visibility caching**: `Hide` / `Show` is only emitted when the
+  desired state actually changes from the previous frame. Previously
+  every frame queued an unconditional `Hide`, which produced visible
+  cursor blink through ConPTY-based multiplexers like wtmux.
+- **Buffered frame output**: stdout is wrapped in a 64 KiB `BufWriter`
+  inside `UI::draw`, collapsing hundreds of per-cell writes into a
+  single syscall on flush.
+- **Color-change caching**: new `set_colors` / `set_bg` / `reset_colors`
+  helpers in `ui.rs` skip `SetForegroundColor` / `SetBackgroundColor` /
+  `ResetColor` when the value would be unchanged. Applied to the grid
+  hot path, which dominates per-frame writes. Per-cell `ResetColor` was
+  removed; cells inherit color from the previous cell and only
+  differences are emitted.
+
 ## [0.2.1] - 2026-05-17
 
 ### Added — File I/O

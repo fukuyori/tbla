@@ -24,6 +24,23 @@ struct CellData {
     formula: Option<String>,
 }
 
+/// Normalize a user-supplied file path string from a dialog or CLI arg.
+/// Trims whitespace and strips one matching pair of surrounding `"` or `'`
+/// characters — Windows Explorer's "Copy as path" wraps the path in `"…"`,
+/// and quotes inside a Windows path are themselves illegal (ERROR_INVALID_NAME).
+pub fn sanitize_path_input(raw: &str) -> String {
+    let trimmed = raw.trim();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 {
+        let first = bytes[0];
+        let last = bytes[bytes.len() - 1];
+        if (first == b'"' && last == b'"') || (first == b'\'' && last == b'\'') {
+            return trimmed[1..trimmed.len() - 1].trim().to_string();
+        }
+    }
+    trimmed.to_string()
+}
+
 /// Save to file (auto-detect extension; defaults to .json).
 pub fn save_to_file(app: &mut App, filename: &str) {
     match save_file(app, filename) {
@@ -45,7 +62,12 @@ pub fn load_from_file(app: &mut App, filename: &str) {
             app.status_message = format!("{} を読み込みました", filename);
         }
         Err(e) => {
-            app.status_message = format!("読み込みエラー: {}", e);
+            let msg = e.to_string();
+            app.status_message = if msg.contains("os error 123") {
+                format!("読み込みエラー: {} (パスに \" や ' などの無効文字が含まれていませんか)", msg)
+            } else {
+                format!("読み込みエラー: {}", msg)
+            };
         }
     }
 }
@@ -512,4 +534,38 @@ fn import_csv(app: &mut App, filename: &str) -> std::io::Result<()> {
     app.view_row = 0;
     app.selection_anchor = None;
     Ok(())
+}
+
+#[cfg(test)]
+mod sanitize_tests {
+    use super::sanitize_path_input;
+
+    #[test]
+    fn strips_double_quotes() {
+        assert_eq!(sanitize_path_input("\"C:\\a\\b.xlsx\""), "C:\\a\\b.xlsx");
+    }
+
+    #[test]
+    fn strips_single_quotes() {
+        assert_eq!(sanitize_path_input("'C:\\a\\b.xlsx'"), "C:\\a\\b.xlsx");
+    }
+
+    #[test]
+    fn leaves_unquoted_alone() {
+        assert_eq!(sanitize_path_input("  C:\\a\\b.xlsx  "), "C:\\a\\b.xlsx");
+    }
+
+    #[test]
+    fn does_not_strip_mismatched() {
+        assert_eq!(sanitize_path_input("\"C:\\a\\b.xlsx"), "\"C:\\a\\b.xlsx");
+    }
+
+    #[test]
+    fn handles_japanese_path() {
+        let p = "\"C:\\Users\\n_fuk\\OneDrive\\デスクトップ\\Chapter1customers.xlsx\"";
+        assert_eq!(
+            sanitize_path_input(p),
+            "C:\\Users\\n_fuk\\OneDrive\\デスクトップ\\Chapter1customers.xlsx"
+        );
+    }
 }

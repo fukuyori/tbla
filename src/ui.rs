@@ -4,7 +4,8 @@ use crossterm::{
     style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
-use std::io::{stdout, Result, Write};
+use std::cell::Cell;
+use std::io::{stdout, BufWriter, Result, Write};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{App, Mode};
@@ -13,6 +14,95 @@ use crate::formula;
 use crate::menu::{MenuBar, MenuState, SubItem, ContextMenu};
 
 const ROW_LABEL_WIDTH: usize = 5;
+
+/// Synchronized Output (DEC mode 2026) begin/end sequences.
+///
+/// Detection priority:
+/// - `$WTMUX` (fukuyori/wtmux on Windows): does not support mode 2026 and runs
+///   on ConPTY where the sequence would just be ignored. We emit empty strings
+///   so we don't add per-frame noise.
+/// - `$TMUX`: wrap in DCS passthrough (`\ePtmux;\e…\e\\`) so the sequence
+///   reaches the outer terminal even on tmux that does not handle 2026 natively.
+/// - Otherwise: bare sequence.
+fn sync_sequences() -> (&'static str, &'static str) {
+    use std::sync::OnceLock;
+    static SEQS: OnceLock<(&'static str, &'static str)> = OnceLock::new();
+    *SEQS.get_or_init(|| {
+        if std::env::var_os("WTMUX").is_some() {
+            ("", "")
+        } else if std::env::var_os("TMUX").is_some() {
+            ("\x1bPtmux;\x1b\x1b[?2026h\x1b\\", "\x1bPtmux;\x1b\x1b[?2026l\x1b\\")
+        } else {
+            ("\x1b[?2026h", "\x1b[?2026l")
+        }
+    })
+}
+
+// Tracks whether the terminal cursor is currently shown, so we only emit
+// Show/Hide commands when the desired state actually changes. Toggling the
+// cursor on every frame causes visible blink/flicker through ConPTY-based
+// multiplexers like wtmux.
+thread_local! {
+    /// Last (fg, bg) emitted by `set_colors`. `None` means "unknown / reset".
+    static LAST_COLORS: Cell<(Option<Color>, Option<Color>)> = const { Cell::new((None, None)) };
+}
+
+/// Emit `SetForegroundColor` / `SetBackgroundColor` only when the value
+/// actually changes from the previous call. Cuts down on the per-cell color
+/// toggle traffic in the grid hot path, which dominates per-frame writes.
+fn set_colors<W: Write>(stdout: &mut W, fg: Color, bg: Color) -> Result<()> {
+    let (last_fg, last_bg) = LAST_COLORS.with(|c| c.get());
+    let mut new_fg = last_fg;
+    let mut new_bg = last_bg;
+    if last_fg != Some(fg) {
+        queue!(stdout, SetForegroundColor(fg))?;
+        new_fg = Some(fg);
+    }
+    if last_bg != Some(bg) {
+        queue!(stdout, SetBackgroundColor(bg))?;
+        new_bg = Some(bg);
+    }
+    LAST_COLORS.with(|c| c.set((new_fg, new_bg)));
+    Ok(())
+}
+
+/// Like `set_colors` but only sets the background; foreground is left alone.
+fn set_bg<W: Write>(stdout: &mut W, bg: Color) -> Result<()> {
+    let (last_fg, last_bg) = LAST_COLORS.with(|c| c.get());
+    if last_bg != Some(bg) {
+        queue!(stdout, SetBackgroundColor(bg))?;
+        LAST_COLORS.with(|c| c.set((last_fg, Some(bg))));
+    }
+    Ok(())
+}
+
+fn reset_colors<W: Write>(stdout: &mut W) -> Result<()> {
+    queue!(stdout, ResetColor)?;
+    LAST_COLORS.with(|c| c.set((None, None)));
+    Ok(())
+}
+
+/// Discard any cached color state. Call when stale state could have leaked in
+/// (e.g., right after entering the alternate screen, after Clear). Currently
+/// called once per `draw()` to keep the implementation conservative.
+fn invalidate_color_cache() {
+    LAST_COLORS.with(|c| c.set((None, None)));
+}
+
+fn set_cursor_visible<W: Write>(stdout: &mut W, want_visible: bool) -> Result<()> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static CURSOR_VISIBLE: AtomicBool = AtomicBool::new(false);
+    let cur = CURSOR_VISIBLE.load(Ordering::Relaxed);
+    if cur != want_visible {
+        if want_visible {
+            queue!(stdout, Show)?;
+        } else {
+            queue!(stdout, Hide)?;
+        }
+        CURSOR_VISIBLE.store(want_visible, Ordering::Relaxed);
+    }
+    Ok(())
+}
 
 // Colors
 const GREEN: Color = Color::Rgb { r: 0, g: 170, b: 0 };
@@ -243,7 +333,13 @@ impl UI {
     }
 
     pub fn draw(app: &App) -> Result<()> {
-        let mut stdout = stdout();
+        // Buffer the whole frame into a single write — far fewer syscalls
+        // means less observable "drawing" through ConPTY / wtmux.
+        let raw = stdout();
+        let mut stdout = BufWriter::with_capacity(64 * 1024, raw.lock());
+        // Color cache is only valid within a single sequence of writes; clear
+        // it conservatively at the top of each frame.
+        invalidate_color_cache();
         let (term_width, term_height) = terminal::size()?;
         // Layout: row 0 = menu bar, row 1 = column headers, grid, then formula bar + status
         let grid_height = (term_height as usize).saturating_sub(4);
@@ -251,7 +347,13 @@ impl UI {
 
         let cursor_color = Self::cursor_color(app.mode);
 
-        queue!(stdout, Hide)?;
+        // Begin synchronized update (DEC mode 2026): tells modern terminals to
+        // buffer the frame and present it atomically, eliminating tearing/flicker.
+        // Empty when running under wtmux (which does not support it).
+        let (sync_begin, sync_end) = sync_sequences();
+        if !sync_begin.is_empty() {
+            write!(stdout, "{}", sync_begin)?;
+        }
         queue!(stdout, MoveTo(0, 0))?;
 
         Self::draw_menu_bar(&mut stdout, app, term_width)?;
@@ -273,30 +375,37 @@ impl UI {
 
         // Position the OS-level terminal cursor so the IME composition window
         // (which appears at the cursor) shows up at the editing location.
+        // Only toggle visibility when it actually changes — see set_cursor_visible.
         if app.mode == Mode::Edit {
             if let Some((cx, cy)) = Self::editing_cursor_pos(app, &visible_cols) {
-                queue!(stdout, MoveTo(cx, cy), Show)?;
+                queue!(stdout, MoveTo(cx, cy))?;
+                set_cursor_visible(&mut stdout, true)?;
             } else {
-                queue!(stdout, Hide)?;
+                set_cursor_visible(&mut stdout, false)?;
             }
         } else if app.mode == Mode::Dialog {
             // Place the cursor at the end of the dialog input
             if let Some(dialog) = &app.dialog {
                 let prefix = format!(" {}: ", dialog.label);
                 let x = display_width(&prefix) + display_width(&dialog.input);
-                queue!(stdout, MoveTo(x as u16, term_height - 2), Show)?;
+                queue!(stdout, MoveTo(x as u16, term_height - 2))?;
+                set_cursor_visible(&mut stdout, true)?;
             } else {
-                queue!(stdout, Hide)?;
+                set_cursor_visible(&mut stdout, false)?;
             }
         } else {
-            queue!(stdout, Hide)?;
+            set_cursor_visible(&mut stdout, false)?;
         }
 
+        // End synchronized update — present the buffered frame atomically.
+        if !sync_end.is_empty() {
+            write!(stdout, "{}", sync_end)?;
+        }
         stdout.flush()?;
         Ok(())
     }
 
-    fn draw_menu_bar(stdout: &mut std::io::Stdout, app: &App, term_width: u16) -> Result<()> {
+    fn draw_menu_bar(stdout: &mut impl Write, app: &App, term_width: u16) -> Result<()> {
         queue!(
             stdout,
             MoveTo(0, 0),
@@ -324,7 +433,7 @@ impl UI {
         Ok(())
     }
 
-    fn draw_open_menu(stdout: &mut std::io::Stdout, bar: &MenuBar, state: &MenuState) -> Result<()> {
+    fn draw_open_menu(stdout: &mut impl Write, bar: &MenuBar, state: &MenuState) -> Result<()> {
         let Some(idx) = state.open else { return Ok(()); };
         let positions = bar.bar_positions();
         let (x_start, _) = positions[idx];
@@ -363,7 +472,7 @@ impl UI {
         Ok(())
     }
 
-    fn draw_context_menu(stdout: &mut std::io::Stdout, cm: &ContextMenu) -> Result<()> {
+    fn draw_context_menu(stdout: &mut impl Write, cm: &ContextMenu) -> Result<()> {
         let width = cm.width;
         // Top border
         queue!(stdout, MoveTo(cm.col, cm.row), SetBackgroundColor(MENU_BG), SetForegroundColor(MENU_FG))?;
@@ -397,7 +506,7 @@ impl UI {
         Ok(())
     }
 
-    fn draw_dialog(stdout: &mut std::io::Stdout, app: &App, term_height: u16, term_width: u16) -> Result<()> {
+    fn draw_dialog(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
         let Some(dialog) = &app.dialog else { return Ok(()); };
 
         // Render as bottom prompt (overlays the formula bar area)
@@ -426,7 +535,7 @@ impl UI {
         Ok(())
     }
 
-    fn draw_column_headers(stdout: &mut std::io::Stdout, _app: &App, visible_cols: &[(usize, usize)], term_width: u16) -> Result<()> {
+    fn draw_column_headers(stdout: &mut impl Write, _app: &App, visible_cols: &[(usize, usize)], term_width: u16) -> Result<()> {
         queue!(
             stdout,
             MoveTo(0, 1),
@@ -454,7 +563,7 @@ impl UI {
         Ok(())
     }
 
-    fn draw_grid(stdout: &mut std::io::Stdout, app: &App, grid_height: usize, visible_cols: &[(usize, usize)], term_width: u16, cursor_color: Color) -> Result<()> {
+    fn draw_grid(stdout: &mut impl Write, app: &App, grid_height: usize, visible_cols: &[(usize, usize)], term_width: u16, cursor_color: Color) -> Result<()> {
         let has_selection = app.has_selection();
         let (sel_min_col, sel_min_row, sel_max_col, sel_max_row) = if has_selection {
             app.get_selection_bounds()
@@ -482,22 +591,14 @@ impl UI {
             // Start with a fully-cleared line in the default cell background
             // so any residual content (e.g. left over from IME composition or
             // a previous wider render) is wiped.
-            queue!(
-                stdout,
-                MoveTo(0, screen_row),
-                SetBackgroundColor(Color::Black),
-                Clear(ClearType::CurrentLine)
-            )?;
+            queue!(stdout, MoveTo(0, screen_row))?;
+            set_bg(stdout, Color::Black)?;
+            queue!(stdout, Clear(ClearType::CurrentLine))?;
 
             // Row label
-            queue!(
-                stdout,
-                MoveTo(0, screen_row),
-                SetBackgroundColor(GREEN),
-                SetForegroundColor(Color::Black),
-            )?;
+            queue!(stdout, MoveTo(0, screen_row))?;
+            set_colors(stdout, Color::Black, GREEN)?;
             write!(stdout, "{:>width$}", actual_row + 1, width = ROW_LABEL_WIDTH)?;
-            queue!(stdout, ResetColor)?;
 
             let mut used = ROW_LABEL_WIDTH;
             let mut col_idx = 0;
@@ -609,15 +710,15 @@ impl UI {
                     let used_w = view.width();
                     let pad = content_width.saturating_sub(used_w);
 
-                    queue!(stdout, SetBackgroundColor(bg), SetForegroundColor(fg))?;
+                    set_colors(stdout, fg, bg)?;
                     write!(stdout, "{}", view.left)?;
 
                     // Inverted cursor cell
-                    queue!(stdout, SetBackgroundColor(fg), SetForegroundColor(bg))?;
+                    set_colors(stdout, bg, fg)?;
                     write!(stdout, "{}", view.cursor_char)?;
 
                     // Restore and finish
-                    queue!(stdout, SetBackgroundColor(bg), SetForegroundColor(fg))?;
+                    set_colors(stdout, fg, bg)?;
                     write!(stdout, "{}{} ", view.right, " ".repeat(pad))?;
                 } else {
                     let content = if value_display_width > content_width {
@@ -631,7 +732,7 @@ impl UI {
                         value
                     };
 
-                    queue!(stdout, SetBackgroundColor(bg), SetForegroundColor(fg))?;
+                    set_colors(stdout, fg, bg)?;
 
                     let formatted = if is_number {
                         pad_to_width(&content, content_width, true)
@@ -641,23 +742,24 @@ impl UI {
                     write!(stdout, "{} ", formatted)?;
                 }
 
-                queue!(stdout, ResetColor)?;
+                // Note: no ResetColor here — next cell will set its own colors
+                // via set_colors(), which makes the cache do useful work across
+                // adjacent same-colored cells.
                 used += total_width;
                 col_idx += 1 + covered_count;
             }
 
             let remaining = (term_width as usize).saturating_sub(used);
             if remaining > 0 {
-                queue!(stdout, SetBackgroundColor(Color::Black))?;
+                set_bg(stdout, Color::Black)?;
                 write!(stdout, "{:width$}", "", width = remaining)?;
-                queue!(stdout, ResetColor)?;
             }
         }
-
+        reset_colors(stdout)?;
         Ok(())
     }
 
-    fn draw_formula_bar(stdout: &mut std::io::Stdout, app: &App, term_height: u16, term_width: u16) -> Result<()> {
+    fn draw_formula_bar(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
         queue!(
             stdout,
             MoveTo(0, term_height - 2),
@@ -704,7 +806,7 @@ impl UI {
         Ok(())
     }
 
-    fn draw_status_bar(stdout: &mut std::io::Stdout, app: &App, term_height: u16, term_width: u16) -> Result<()> {
+    fn draw_status_bar(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
         queue!(
             stdout,
             MoveTo(0, term_height - 1),
@@ -719,7 +821,13 @@ impl UI {
             Mode::Dialog => "入力",
             Mode::ContextMenu => "コンテキスト",
         };
-        let file_str = app.current_file.as_deref().unwrap_or("[新規]");
+        let file_str = app.current_file.as_deref()
+            .map(|p| std::path::Path::new(p)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(p)
+                .to_string())
+            .unwrap_or_else(|| "[新規]".to_string());
 
         let left = if !app.status_message.is_empty() {
             format!(" {} ", app.status_message)
@@ -728,9 +836,14 @@ impl UI {
         };
         let right = format!(" {} | {} | F10:メニュー ", mode_str, file_str);
 
-        let left_w = display_width(&left);
+        let term_w = term_width as usize;
+        // Right side gets priority — clip it first if even it is too wide.
+        let right = truncate_to_width(&right, term_w);
         let right_w = display_width(&right);
-        let padding = (term_width as usize).saturating_sub(left_w + right_w);
+        let left_max = term_w.saturating_sub(right_w);
+        let left = truncate_to_width(&left, left_max);
+        let left_w = display_width(&left);
+        let padding = term_w.saturating_sub(left_w + right_w);
         write!(stdout, "{}{:width$}{}", left, "", right, width = padding)?;
         queue!(stdout, ResetColor)?;
         Ok(())
