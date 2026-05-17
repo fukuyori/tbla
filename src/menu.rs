@@ -31,6 +31,7 @@ pub enum Action {
     FormatAutoWidth,
     FormatWiderCol,
     FormatNarrowerCol,
+    FormatSetWidth,
 
     HelpKeys,
     HelpAbout,
@@ -243,6 +244,12 @@ impl MenuBar {
                         mnemonic: Some('N'),
                         shortcut: None,
                         action: Action::FormatNarrowerCol,
+                    },
+                    SubItem::Item {
+                        label: "列幅を変更...".to_string(),
+                        mnemonic: Some('S'),
+                        shortcut: None,
+                        action: Action::FormatSetWidth,
                     },
                 ],
             },
@@ -463,6 +470,7 @@ impl ContextMenu {
             ("行を削除".to_string(), Action::DeleteRow),
             ("列を削除".to_string(), Action::DeleteCol),
             ("列幅を自動調整".to_string(), Action::FormatAutoWidth),
+            ("列幅を変更...".to_string(), Action::FormatSetWidth),
         ];
 
         let width = items.iter().map(|(s, _)| UnicodeWidthStr::width(s.as_str())).max().unwrap_or(20) + 4;

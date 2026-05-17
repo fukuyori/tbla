@@ -439,7 +439,11 @@ impl UI {
         let mut used = ROW_LABEL_WIDTH;
         for &(col, col_width) in visible_cols {
             let col_name = formula::col_to_name(col);
-            write!(stdout, "{:^width$}", col_name, width = col_width)?;
+            // Reserve the last column of each header slot for a resize-handle
+            // separator. The column name is centered in the remaining width.
+            let name_width = col_width.saturating_sub(1).max(1);
+            write!(stdout, "{:^width$}", col_name, width = name_width)?;
+            write!(stdout, "│")?;
             used += col_width;
         }
 

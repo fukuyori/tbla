@@ -7,6 +7,8 @@ A terminal spreadsheet editor with standard keyboard and mouse operation.
 
 [日本語](README_ja.md)
 
+![tbla screenshot](images/screenshot.png)
+
 ## Overview
 
 tbla is a terminal-based spreadsheet editor. It uses familiar keyboard
@@ -21,7 +23,7 @@ menu bar at the top of the screen for file and edit operations.
 - **Menu bar** — File / Edit / Insert / Format / Help (press F10 or click)
 - **Excel-style point mode** — Pick cell references with arrows / mouse while
   editing a formula
-- **Formula engine** — 35+ functions (SUM, VLOOKUP, IF, etc.)
+- **Formula engine** — 70+ functions (SUM, VLOOKUP, IF, date, financial, trig, stats, etc.)
 - **Absolute/Relative references** — $A$1, $A1, A$1, A1
 - **Formula adjustment** — References auto-update on row/column insert/delete
 - **Copy & paste** — Ctrl+C / Ctrl+X / Ctrl+V (also writes to system clipboard)
@@ -66,8 +68,41 @@ tbla data.csv
 | Key | Action |
 |-----|--------|
 | `↑` `↓` `←` `→` | Move cursor |
+| `Ctrl+H` / `Ctrl+J` / `Ctrl+K` / `Ctrl+L` | Left / Down / Up / Right (home-row navigation) |
+| `Ctrl+Shift+H/J/K/L` | Same, extending the selection |
 | `Tab` / `Shift+Tab` | Move right / left |
 | `Enter` / `Shift+Enter` | Move down / up |
+
+### macOS without dedicated Home/End keys
+
+On Mac keyboards that lack Home/End, use **`Fn+arrow`** — the OS converts
+these to Home/End/PgUp/PgDn at the keyboard level, so no extra setup is
+needed.
+
+| Press | Sent as | Action |
+|-------|---------|--------|
+| `Fn+←` | Home | Beginning of row |
+| `Fn+→` | End | End of row (last data column) |
+| `Fn+↑` | PgUp | Page up |
+| `Fn+↓` | PgDn | Page down |
+
+For A1 / last data cell, use `Ctrl+Home` / `Ctrl+End` (i.e. `Fn+Ctrl+←` /
+`Fn+Ctrl+→` on Mac).
+
+### `Shift+↑/↓` not working in macOS Terminal.app
+
+The default Terminal.app profile drops the SHIFT modifier on `Shift+↑` /
+`Shift+↓`, so vertical range extension via Shift+Arrow doesn't reach the
+application (left/right work fine). Pick one workaround:
+
+- **Alternate keys**: `Ctrl+Shift+K` (extend up) / `Ctrl+Shift+J` (extend down)
+- **Patch Terminal.app**: Settings → Profiles → *your profile* → Keyboard tab,
+  add via `+`:
+  - Key `↑`, Modifier `Shift`, Action `Send Text`, Value `\033[1;2A`
+  - Key `↓`, Modifier `Shift`, Action `Send Text`, Value `\033[1;2B`
+- **Use a different terminal**: iTerm2 / WezTerm / Alacritty / kitty all
+  handle `Shift+Arrow` correctly out of the box.
+
 | `Home` | Beginning of row |
 | `End` | Last cell with data in row |
 | `Ctrl+Home` | Go to A1 |
@@ -104,6 +139,27 @@ tbla data.csv
 | `Backspace` | Delete character before cursor |
 | `Delete` / `Ctrl+D` | Delete character at cursor |
 | `Ctrl+K` | Delete from cursor to end of line |
+
+### Aggregate-formula auto-completion
+
+When you commit a bare `=SUM`, `=AVG` / `=AVERAGE`, `=MIN`, `=MAX`, `=COUNT`,
+or `=COUNTA` (with optional empty parens) by pressing Enter, the range
+argument is filled in automatically from the adjacent numeric data.
+
+| Input | Adjacent data | Completed |
+|-------|---------------|-----------|
+| `=sum` | A1:A3 numeric, cursor at A4 | `=SUM(A1:A3)` |
+| `=avg` | same | `=AVERAGE(A1:A3)` |
+| `=max()` | B5:D5 numeric, cursor at E5 (nothing above) | `=MAX(B5:D5)` |
+| `=min` | no adjacent data | left as-is |
+
+**Detection rules:**
+1. **Up first**: if the cell directly above is numeric, extend up while the run stays numeric.
+2. **Then left**: if the cell directly to the left is numeric, extend left.
+3. **Up wins** when both directions have data.
+4. The run stops at any text or empty cell.
+5. A single-cell run is written as `=SUM(A1)`; multi-cell as `=SUM(A1:A3)`.
+6. Formula cells that evaluate to a number count as numeric.
 
 ### Formula reference selection (point mode)
 
@@ -165,6 +221,7 @@ range in darker blue).
 | Mouse wheel | Scroll up/down |
 | Right click | Context menu (cut/copy/paste/insert/delete) |
 | Click on menu bar | Open that menu |
+| Drag the `│` separator in the column header | Resize column width (in macOS Terminal.app hold ⌥ while dragging) |
 
 ## Menu Bar
 
@@ -176,23 +233,91 @@ range in darker blue).
 
 ## Supported Functions
 
-### Math & Statistics
-`SUM`, `AVERAGE`, `COUNT`, `COUNTA`, `MIN`, `MAX`, `ABS`, `ROUND`, `INT`, `MOD`, `POWER`, `SQRT`
+### Aggregate
+`SUM`, `AVERAGE` (= `AVG`), `COUNT`, `COUNTA`, `MIN`, `MAX`
 
-### Conditional
-`IF`, `SUMIF`, `COUNTIF`, `AVERAGEIF`, `IFERROR`
+### Math
+`ABS`, `ROUND`, `ROUNDUP`, `ROUNDDOWN`, `CEILING`, `FLOOR`, `INT`, `MOD`, `POWER`, `SQRT`
+
+### Trigonometry / angle
+`SIN`, `COS`, `TAN`, `ASIN`, `ACOS`, `ATAN`, `ATAN2`, `RADIANS`, `DEGREES`
+
+### Logarithm / exponent
+`LN`, `LOG`, `LOG10`, `EXP`, `PI`
+
+### Statistics
+`STDEV` (= `STDEV.S`), `VAR` (= `VAR.S`), `MEDIAN`, `MODE`
+
+### Random / multiples
+`RAND`, `RANDBETWEEN`, `GCD`, `LCM`, `FACT`
+
+### Conditional aggregate
+`IF`, `SUMIF`, `COUNTIF`, `AVERAGEIF`, `SUMIFS`, `COUNTIFS`, `AVERAGEIFS`, `IFERROR`
+
+### Date / time
+`TODAY`, `NOW`, `DATE`, `YEAR`, `MONTH`, `DAY`, `HOUR`, `MINUTE`, `SECOND`, `TIME`,
+`WEEKDAY`, `WEEKNUM`, `DATEDIF`, `EDATE`, `EOMONTH`, `DAYS`
+
+Dates are stored as serial numbers (days since 1899-12-30). `=DATE(2024, 1, 1)`
+returns a serial value that can be decomposed with `=YEAR(A1)` etc. The
+fractional part of `NOW()` is the time component.
+
+### Financial
+`PMT`, `PV`, `FV`, `RATE`, `NPER`, `NPV`, `IRR`
+
+Follows Excel cash-flow sign convention: money received = positive, money paid
+= negative. Example: $100,000 mortgage at 5% APR, monthly compounding, 30
+years → `=PMT(0.05/12, 360, 100000)` ≈ -536.82.
 
 ### Lookup
 `VLOOKUP`, `HLOOKUP`, `INDEX`, `MATCH`
 
 ### Text
-`LEFT`, `RIGHT`, `MID`, `LEN`, `TRIM`, `UPPER`, `LOWER`, `CONCATENATE`
+`LEFT`, `RIGHT`, `MID`, `LEN`, `TRIM`, `UPPER`, `LOWER`, `CONCATENATE` (= `CONCAT`)
 
 ### Logical
 `AND`, `OR`, `NOT`
 
 ### Information
 `ISBLANK`, `ISNUMBER`, `ISTEXT`
+
+## Calculation Conventions
+
+### Floating-point comparison (relative tolerance)
+
+Numeric `=`, `<>`, `>`, `<`, `>=`, `<=`, the criteria of `SUMIF` /
+`COUNTIF` / `*IFS`, and exact-match `VLOOKUP` / `MATCH` all use a
+**~15-significant-digit relative tolerance** instead of raw IEEE 754
+equality.
+
+Examples:
+```
+=(0.1+0.2)=0.3          → TRUE   (raw f64 is 0.30000000000000004)
+=(0.1+0.2)>=0.3         → TRUE   (boundary counts as equal)
+=(0.1+0.2)>0.3          → FALSE  (strict > excludes the equal band)
+=COUNTIF(A1, ">=0.3")   → 1      (when A1 = `=0.1+0.2`)
+```
+
+The tolerance is `max(|a|, |b|, 1.0) * 1e-12` — it scales with magnitude.
+You get roughly 3 digits of headroom for accumulated rounding, so even
+deeply nested formulas stay stable.
+
+### Date serial numbers (Power BI convention)
+
+`DATE`, `TODAY`, `NOW`, etc. return serial values where **1899-12-30 = 0**.
+
+| Date       | Serial | vs Excel               |
+|------------|--------|------------------------|
+| 1899-12-30 | 0      | n/a                    |
+| 1900-01-01 | 2      | Excel: 1 (off by 1)    |
+| 1900-02-28 | 60     | Excel: 59 (off by 1)   |
+| 1900-03-01 | 61     | **matches Excel**       |
+| 2024-01-01 | 45292  | **matches Excel**       |
+
+Dates from 1900-03-01 onward match Excel exactly. January / February 1900
+are 1 lower because Excel pretends 1900-02-29 existed; tbla follows the
+Power BI convention and **fixes this 1900 leap-year bug** (pure Gregorian).
+`WEEKDAY` is correct year-round.
 
 ## File Formats
 

@@ -1,4 +1,5 @@
 mod cell;
+mod date_util;
 mod engine;
 mod formula;
 mod sheet;
@@ -8,9 +9,13 @@ mod menu;
 
 use crossterm::{
     cursor::{Hide, Show},
-    event::{self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton, EnableMouseCapture, DisableMouseCapture},
+    event::{
+        self, Event, KeyCode, KeyEvent, KeyModifiers, MouseEvent, MouseEventKind, MouseButton,
+        EnableMouseCapture, DisableMouseCapture,
+        KeyboardEnhancementFlags, PushKeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    },
     execute,
-    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen, supports_keyboard_enhancement},
 };
 use std::io::{stdout, Result};
 
@@ -36,6 +41,11 @@ pub enum DialogKind {
     ExportCsv,
     Find,
     Goto,
+    /// Set width of the column at `cursor_col` (target column captured when
+    /// the dialog is opened so the user can move the cursor without losing
+    /// the intended target — but currently we just read cursor_col on
+    /// commit, since the cursor doesn't move while the dialog is open).
+    SetColWidth,
 }
 
 #[derive(Clone, Debug)]
@@ -71,6 +81,9 @@ pub struct App {
     pub last_click_at: Option<std::time::Instant>,
     pub last_click_cell: Option<(usize, usize)>,
     pub point_mode: Option<PointMode>,
+    /// Active column-width drag: (column index, screen x where the drag began,
+    /// the column's width at the start of the drag).
+    pub column_resize: Option<(usize, u16, usize)>,
 }
 
 /// Point mode (Excel-style formula reference selection).
@@ -123,6 +136,7 @@ impl App {
             last_click_at: None,
             last_click_cell: None,
             point_mode: None,
+            column_resize: None,
         }
     }
 
@@ -246,6 +260,27 @@ impl App {
             col += 1;
         }
 
+        None
+    }
+
+    /// If `(screen_col, screen_row)` falls on a column-width resize handle
+    /// (the rightmost cell of any visible column header), return that column.
+    /// Resize handles live on screen row 1 (the column-header row).
+    pub fn screen_to_col_edge(&self, screen_col: u16, screen_row: u16) -> Option<usize> {
+        const ROW_LABEL_WIDTH: usize = 5;
+        if screen_row != 1 { return None; }
+        let (term_width, _) = terminal::size().unwrap_or((80, 24));
+        let mut x = ROW_LABEL_WIDTH;
+        let mut col = self.view_col;
+        while x < term_width as usize && col <= 255 {
+            let col_width = self.sheet.get_col_width(col);
+            let right_edge = x + col_width - 1;
+            if (screen_col as usize) == right_edge {
+                return Some(col);
+            }
+            x += col_width;
+            col += 1;
+        }
         None
     }
 
@@ -434,6 +469,20 @@ impl App {
 
     /// Commit current edit input to the cell.
     pub fn commit_edit(&mut self) {
+        // Auto-completion for aggregate formulas (=sum / =avg / =min / =max / =count / =counta).
+        // If the user typed only the function name (with optional empty parens),
+        // detect the contiguous numeric block above (preferred) or to the left
+        // and fill in the range argument automatically.
+        if let Some(completed) = autocomplete_aggregate(
+            &self.sheet,
+            &self.input_buffer,
+            self.cursor_col,
+            self.cursor_row,
+        ) {
+            self.status_message = format!("自動補完: {}", completed);
+            self.input_buffer = completed;
+        }
+
         if self.input_buffer != self.edit_original {
             self.save_undo();
             self.sheet.set_cell(self.cursor_col, self.cursor_row, self.input_buffer.clone());
@@ -768,6 +817,16 @@ impl App {
                 let w = self.sheet.get_col_width(self.cursor_col);
                 self.status_message = format!("列幅: {}", w);
             }
+            Action::FormatSetWidth => {
+                let cur = self.sheet.get_col_width(self.cursor_col);
+                let col_name = crate::formula::col_to_name(self.cursor_col);
+                self.dialog = Some(Dialog {
+                    kind: DialogKind::SetColWidth,
+                    label: format!("列 {} の幅 (3-50)", col_name),
+                    input: cur.to_string(),
+                });
+                self.mode = Mode::Dialog;
+            }
             Action::HelpKeys => {
                 self.status_message = "矢印=移動 / Tab/Enter=次セル / F2=編集 / Ctrl+C/X/V=コピー切取貼付 / Ctrl+Z=戻 / Ctrl+S=保存 / F10=メニュー".to_string();
             }
@@ -820,10 +879,230 @@ impl App {
                     self.status_message = "無効なセル参照です".to_string();
                 }
             }
+            DialogKind::SetColWidth => {
+                match input.parse::<usize>() {
+                    Ok(w) => {
+                        self.sheet.set_col_width(self.cursor_col, w);
+                        let actual = self.sheet.get_col_width(self.cursor_col);
+                        let name = crate::formula::col_to_name(self.cursor_col);
+                        self.status_message = if actual == w {
+                            format!("列 {} 幅: {}", name, actual)
+                        } else {
+                            format!("列 {} 幅: {} (3-50 にクランプ)", name, actual)
+                        };
+                    }
+                    Err(_) => {
+                        self.status_message = "無効な数値です".to_string();
+                    }
+                }
+            }
         }
 
         self.dialog = None;
         self.mode = Mode::Normal;
+    }
+}
+
+/// Return true if the given cell holds a number (or a formula that evaluates
+/// to a number). Used by the aggregate auto-completion to decide range bounds.
+fn is_numeric_cell(sheet: &Sheet, col: usize, row: usize) -> bool {
+    let cell = sheet.get_cell(col, row);
+    match &cell.value {
+        crate::cell::CellValue::Number(_) => true,
+        crate::cell::CellValue::Formula(_) => {
+            sheet.evaluate(col, row).parse::<f64>().is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Find the contiguous numeric block adjacent to (col, row). Tries the cells
+/// directly above first (preferred), then to the left. Returns the bounds
+/// `(start_col, start_row, end_col, end_row)` of the range, or None.
+fn detect_aggregate_range(
+    sheet: &Sheet,
+    col: usize,
+    row: usize,
+) -> Option<(usize, usize, usize, usize)> {
+    // Try UP: walk up from (col, row-1) while cells are numeric.
+    if row > 0 && is_numeric_cell(sheet, col, row - 1) {
+        let mut start_row = row - 1;
+        while start_row > 0 && is_numeric_cell(sheet, col, start_row - 1) {
+            start_row -= 1;
+        }
+        return Some((col, start_row, col, row - 1));
+    }
+
+    // Then LEFT: walk left from (col-1, row).
+    if col > 0 && is_numeric_cell(sheet, col - 1, row) {
+        let mut start_col = col - 1;
+        while start_col > 0 && is_numeric_cell(sheet, start_col - 1, row) {
+            start_col -= 1;
+        }
+        return Some((start_col, row, col - 1, row));
+    }
+
+    None
+}
+
+/// If `input` is a bare aggregate-function reference such as `=sum`, `=avg`,
+/// `=MIN()`, or `=Average( )`, build a completed formula with the auto-detected
+/// range. Returns None when no completion applies (already has arguments, not
+/// a supported function, or no adjacent numeric data).
+fn autocomplete_aggregate(
+    sheet: &Sheet,
+    input: &str,
+    col: usize,
+    row: usize,
+) -> Option<String> {
+    let trimmed = input.trim();
+    if !trimmed.starts_with('=') {
+        return None;
+    }
+    let body = trimmed[1..].trim();
+
+    // Accept `funcname`, `funcname()`, `funcname(  )`, or `funcname(`.
+    let func_name = if let Some(idx) = body.find('(') {
+        let name = body[..idx].trim();
+        let rest = body[idx + 1..].trim_end_matches(')').trim();
+        if !rest.is_empty() {
+            return None; // already has arguments
+        }
+        name
+    } else {
+        body
+    };
+
+    if func_name.is_empty() {
+        return None;
+    }
+
+    // Canonicalize the name. Aliases map to their engine-supported form.
+    let canonical = match func_name.to_uppercase().as_str() {
+        "SUM" => "SUM",
+        "AVG" | "AVERAGE" => "AVERAGE",
+        "MIN" => "MIN",
+        "MAX" => "MAX",
+        "COUNT" => "COUNT",
+        "COUNTA" => "COUNTA",
+        _ => return None,
+    };
+
+    let (sc, sr, ec, er) = detect_aggregate_range(sheet, col, row)?;
+    let range = if sc == ec && sr == er {
+        crate::formula::cell_name(sc, sr)
+    } else {
+        format!(
+            "{}:{}",
+            crate::formula::cell_name(sc, sr),
+            crate::formula::cell_name(ec, er)
+        )
+    };
+
+    Some(format!("={}({})", canonical, range))
+}
+
+#[cfg(test)]
+mod autocomplete_tests {
+    use super::*;
+
+    fn sheet_with(cells: &[(usize, usize, &str)]) -> Sheet {
+        let mut s = Sheet::new();
+        for (c, r, v) in cells {
+            s.set_cell(*c, *r, v.to_string());
+        }
+        s
+    }
+
+    #[test]
+    fn completes_sum_using_column_above() {
+        // A1..A3 are numbers, cursor at A4 typing =sum
+        let s = sheet_with(&[(0, 0, "10"), (0, 1, "20"), (0, 2, "30")]);
+        let out = autocomplete_aggregate(&s, "=sum", 0, 3);
+        assert_eq!(out.as_deref(), Some("=SUM(A1:A3)"));
+    }
+
+    #[test]
+    fn completes_average_alias_avg() {
+        let s = sheet_with(&[(0, 0, "1"), (0, 1, "2")]);
+        let out = autocomplete_aggregate(&s, "=avg", 0, 2);
+        assert_eq!(out.as_deref(), Some("=AVERAGE(A1:A2)"));
+    }
+
+    #[test]
+    fn completes_max_using_row_left_when_above_empty() {
+        // B5..D5 are numbers, cursor at E5
+        let s = sheet_with(&[(1, 4, "5"), (2, 4, "7"), (3, 4, "9")]);
+        let out = autocomplete_aggregate(&s, "=max", 4, 4);
+        assert_eq!(out.as_deref(), Some("=MAX(B5:D5)"));
+    }
+
+    #[test]
+    fn prefers_above_over_left_when_both_have_data() {
+        // A column above AND row to the left both have numbers
+        let s = sheet_with(&[
+            (1, 0, "10"),
+            (1, 1, "20"),
+            (0, 2, "5"),
+        ]);
+        // cursor at B3 typing =sum: above (B1,B2) wins over left (A3)
+        let out = autocomplete_aggregate(&s, "=sum", 1, 2);
+        assert_eq!(out.as_deref(), Some("=SUM(B1:B2)"));
+    }
+
+    #[test]
+    fn keeps_existing_arguments() {
+        let s = sheet_with(&[(0, 0, "1")]);
+        let out = autocomplete_aggregate(&s, "=sum(A1:A5)", 0, 5);
+        assert_eq!(out, None);
+    }
+
+    #[test]
+    fn handles_empty_parens_and_whitespace() {
+        let s = sheet_with(&[(0, 0, "1"), (0, 1, "2")]);
+        assert_eq!(
+            autocomplete_aggregate(&s, "=SUM()", 0, 2).as_deref(),
+            Some("=SUM(A1:A2)")
+        );
+        assert_eq!(
+            autocomplete_aggregate(&s, "= sum (  )", 0, 2).as_deref(),
+            Some("=SUM(A1:A2)")
+        );
+    }
+
+    #[test]
+    fn no_adjacent_data_returns_none() {
+        let s = Sheet::new();
+        assert_eq!(autocomplete_aggregate(&s, "=sum", 5, 5), None);
+    }
+
+    #[test]
+    fn non_numeric_above_blocks_extension() {
+        // Header text "Total" interrupts the run upward.
+        let s = sheet_with(&[(0, 0, "Total"), (0, 1, "10"), (0, 2, "20")]);
+        let out = autocomplete_aggregate(&s, "=sum", 0, 3);
+        assert_eq!(out.as_deref(), Some("=SUM(A2:A3)"));
+    }
+
+    #[test]
+    fn single_cell_range_uses_bare_reference() {
+        // Only one numeric cell above
+        let s = sheet_with(&[(0, 0, "Header"), (0, 1, "5")]);
+        let out = autocomplete_aggregate(&s, "=sum", 0, 2);
+        assert_eq!(out.as_deref(), Some("=SUM(A2)"));
+    }
+
+    #[test]
+    fn unknown_function_is_ignored() {
+        let s = sheet_with(&[(0, 0, "1")]);
+        assert_eq!(autocomplete_aggregate(&s, "=foobar", 0, 1), None);
+    }
+
+    #[test]
+    fn formula_result_counts_as_numeric() {
+        let s = sheet_with(&[(0, 0, "10"), (0, 1, "=A1*2")]);
+        let out = autocomplete_aggregate(&s, "=sum", 0, 2);
+        assert_eq!(out.as_deref(), Some("=SUM(A1:A2)"));
     }
 }
 
@@ -860,6 +1139,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             KeyCode::Char('f') | KeyCode::Char('F') => { app.dispatch(Action::EditFind); return; }
             KeyCode::Char('g') | KeyCode::Char('G') => { app.dispatch(Action::EditGoto); return; }
             KeyCode::Char('a') | KeyCode::Char('A') => { app.dispatch(Action::EditSelectAll); return; }
+            // Vim-style cell movement with Ctrl modifier (hjkl).
+            // Shift extends the selection (same semantics as Shift+arrow).
+            KeyCode::Char('h') | KeyCode::Char('H') => { app.move_cursor(-1, 0, shift); return; }
+            KeyCode::Char('j') | KeyCode::Char('J') => { app.move_cursor(0, 1, shift); return; }
+            KeyCode::Char('k') | KeyCode::Char('K') => { app.move_cursor(0, -1, shift); return; }
+            KeyCode::Char('l') | KeyCode::Char('L') => { app.move_cursor(1, 0, shift); return; }
             KeyCode::Home => {
                 if shift && app.selection_anchor.is_none() {
                     app.selection_anchor = Some((app.cursor_col, app.cursor_row));
@@ -1321,6 +1606,18 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Column-width resize handle on the header row takes precedence
+            // over cell selection / menu opening.
+            if let Some(rcol) = app.screen_to_col_edge(col, row) {
+                if app.mode == Mode::Edit {
+                    app.commit_edit();
+                    app.mode = Mode::Normal;
+                }
+                let w = app.sheet.get_col_width(rcol);
+                app.column_resize = Some((rcol, col, w));
+                return;
+            }
+
             if let Some((c, r)) = app.screen_to_cell(col, row) {
                 // Excel-style point mode: while editing a formula at a
                 // reference-allowing position, clicking on a cell inserts the
@@ -1367,6 +1664,14 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             }
         }
         MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some((rcol, start_x, start_w)) = app.column_resize {
+                let delta = col as i32 - start_x as i32;
+                let new_w = (start_w as i32 + delta).max(0) as usize;
+                app.sheet.set_col_width(rcol, new_w);
+                let w = app.sheet.get_col_width(rcol);
+                app.status_message = format!("列 {} 幅: {}", crate::formula::col_to_name(rcol), w);
+                return;
+            }
             if app.dragging {
                 if let Some((c, r)) = app.screen_to_cell(col, row) {
                     // In edit mode with active point mode, drag extends the
@@ -1385,6 +1690,10 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
             }
         }
         MouseEventKind::Up(MouseButton::Left) => {
+            if app.column_resize.is_some() {
+                app.column_resize = None;
+                return;
+            }
             app.dragging = false;
             // If anchor == cursor, clear it (just a click, not drag)
             if let Some((ac, ar)) = app.selection_anchor {
@@ -1439,6 +1748,18 @@ fn main() -> Result<()> {
     terminal::enable_raw_mode()?;
     execute!(stdout, EnterAlternateScreen, Hide, EnableMouseCapture)?;
 
+    // Enable Kitty Keyboard Protocol when the terminal supports it. Without
+    // this, some terminals strip the SHIFT modifier from arrow keys once
+    // mouse tracking is on, breaking Shift+Arrow range selection. Supported
+    // by kitty, foot, WezTerm, Alacritty 0.13+, Ghostty, and recent iTerm2.
+    let keyboard_enhancement = supports_keyboard_enhancement().unwrap_or(false);
+    if keyboard_enhancement {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
+        );
+    }
+
     let mut app = App::new();
 
     if args.len() > 1 {
@@ -1469,6 +1790,9 @@ fn main() -> Result<()> {
         }
     }
 
+    if keyboard_enhancement {
+        let _ = execute!(stdout, PopKeyboardEnhancementFlags);
+    }
     execute!(stdout, Show, DisableMouseCapture, LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
     Ok(())
