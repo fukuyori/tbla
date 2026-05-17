@@ -7,6 +7,7 @@ mod ui;
 mod commands;
 mod menu;
 mod xlsx;
+mod xlsx_styles;
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -48,13 +49,66 @@ pub enum DialogKind {
     /// commit, since the cursor doesn't move while the dialog is open).
     SetColWidth,
     PrintHtml,
+    Replace,
+    Sort,
+    Filter,
+    SheetRename,
+    TextColor,
+    BgColor,
+    NumberFormat,
+    ConditionalAdd,
+}
+
+#[derive(Clone, Debug)]
+pub struct DialogField {
+    pub label: String,
+    pub input: String,
 }
 
 #[derive(Clone, Debug)]
 pub struct Dialog {
     pub kind: DialogKind,
-    pub label: String,
-    pub input: String,
+    /// One or more input fields. UI renders them stacked above the formula
+    /// bar; Tab / Shift+Tab cycles focus between them. Field 0 is always the
+    /// initially-focused field.
+    pub fields: Vec<DialogField>,
+    pub focus: usize,
+}
+
+impl Dialog {
+    pub fn single(kind: DialogKind, label: impl Into<String>, input: impl Into<String>) -> Self {
+        Dialog {
+            kind,
+            fields: vec![DialogField { label: label.into(), input: input.into() }],
+            focus: 0,
+        }
+    }
+
+    pub fn multi(kind: DialogKind, fields: Vec<DialogField>) -> Self {
+        Dialog { kind, fields, focus: 0 }
+    }
+
+    pub fn current_input_mut(&mut self) -> &mut String {
+        &mut self.fields[self.focus].input
+    }
+
+    /// First field's input — kept for backward compatibility with single-field
+    /// dialogs that just want one trimmed value.
+    pub fn primary_input(&self) -> &str {
+        &self.fields[0].input
+    }
+
+    pub fn next_field(&mut self) {
+        self.focus = (self.focus + 1) % self.fields.len();
+    }
+
+    pub fn prev_field(&mut self) {
+        if self.focus == 0 {
+            self.focus = self.fields.len() - 1;
+        } else {
+            self.focus -= 1;
+        }
+    }
 }
 
 pub struct App {
@@ -75,6 +129,7 @@ pub struct App {
     pub current_file: Option<String>,
     pub edit_original: String,
     pub last_search: String,
+    pub last_replace: String,
     pub menu_bar: MenuBar,
     pub menu_state: MenuState,
     pub dialog: Option<Dialog>,
@@ -86,6 +141,16 @@ pub struct App {
     /// Active column-width drag: (column index, screen x where the drag began,
     /// the column's width at the start of the drag).
     pub column_resize: Option<(usize, u16, usize)>,
+    /// Rows hidden by an active filter. Session-only — cleared on file save
+    /// and not persisted in any file format.
+    pub hidden_rows: std::collections::HashSet<usize>,
+    /// Workbook structure: `sheet` is the currently active sheet's data;
+    /// `other_sheets` holds the other sheets in workbook order (i.e. with
+    /// the active sheet *removed*); `active_sheet_index` is where the active
+    /// sheet sits in the logical workbook ordering. Switching sheets does a
+    /// swap so call sites using `app.sheet` keep working transparently.
+    pub other_sheets: Vec<Sheet>,
+    pub active_sheet_index: usize,
 }
 
 /// Point mode (Excel-style formula reference selection).
@@ -130,6 +195,7 @@ impl App {
             current_file: None,
             edit_original: String::new(),
             last_search: String::new(),
+            last_replace: String::new(),
             menu_bar: MenuBar::default(),
             menu_state: MenuState::default(),
             dialog: None,
@@ -139,7 +205,131 @@ impl App {
             last_click_cell: None,
             point_mode: None,
             column_resize: None,
+            hidden_rows: std::collections::HashSet::new(),
+            other_sheets: Vec::new(),
+            active_sheet_index: 0,
         }
+    }
+
+    /// Number of sheets in the workbook (active + others).
+    pub fn sheet_count(&self) -> usize {
+        self.other_sheets.len() + 1
+    }
+
+    /// Active sheet's name (convenience).
+    pub fn active_sheet_name(&self) -> &str {
+        &self.sheet.name
+    }
+
+    /// Build the (name, &cells) slice that powers cross-sheet formula
+    /// references. Includes every sheet EXCEPT the active one (foreign cells
+    /// only).
+    pub fn other_sheet_refs(&self) -> Vec<(String, &std::collections::HashMap<(usize, usize), crate::cell::Cell>)> {
+        self.other_sheets.iter()
+            .map(|s| (s.name.clone(), s.cells()))
+            .collect()
+    }
+
+    /// Evaluate a cell on the active sheet with cross-sheet ref support.
+    pub fn evaluate(&self, col: usize, row: usize) -> String {
+        let others = self.other_sheet_refs();
+        self.sheet.evaluate_with(col, row, &others)
+    }
+
+    /// All sheets in workbook order, with the active sheet inserted at its
+    /// position. Used for the tab bar, save, and cross-sheet formula lookups.
+    pub fn workbook_sheets(&self) -> Vec<&Sheet> {
+        let mut v: Vec<&Sheet> = self.other_sheets.iter().collect();
+        v.insert(self.active_sheet_index.min(v.len()), &self.sheet);
+        v
+    }
+
+    /// Switch the active sheet to the given workbook-order index. No-op if
+    /// the index is out of range or already active.
+    pub fn switch_sheet(&mut self, target: usize) {
+        let total = self.sheet_count();
+        if target >= total || target == self.active_sheet_index { return; }
+        // Step 1: put the current active sheet back into other_sheets at
+        // its logical position, replacing it with a placeholder.
+        let placeholder = Sheet::new();
+        let current = std::mem::replace(&mut self.sheet, placeholder);
+        self.other_sheets.insert(self.active_sheet_index, current);
+        // Now other_sheets contains every sheet in workbook order.
+        // Pop the target out and make it active.
+        let new_active = self.other_sheets.remove(target);
+        self.sheet = new_active;
+        self.active_sheet_index = target;
+        // Filters are sheet-local and shouldn't bleed across switches.
+        self.hidden_rows.clear();
+        self.selection_anchor = None;
+        self.cursor_col = 0;
+        self.cursor_row = 0;
+        self.view_col = 0;
+        self.view_row = 0;
+    }
+
+    /// Add a new empty sheet right after the active one and switch to it.
+    /// Returns the new sheet's name.
+    pub fn add_sheet(&mut self, name: Option<String>) -> String {
+        let n = name.unwrap_or_else(|| {
+            // Auto-name: Sheet2, Sheet3, ... avoiding duplicates.
+            let existing: std::collections::HashSet<String> = self.workbook_sheets()
+                .iter().map(|s| s.name.clone()).collect();
+            let mut i = self.sheet_count() + 1;
+            loop {
+                let cand = format!("Sheet{}", i);
+                if !existing.contains(&cand) { break cand; }
+                i += 1;
+            }
+        });
+        let mut new_sheet = Sheet::new();
+        new_sheet.name = n.clone();
+        let insert_at = self.active_sheet_index + 1;
+        // Push current active back into others to make room, then move active.
+        let placeholder = Sheet::new();
+        let prev_active = std::mem::replace(&mut self.sheet, placeholder);
+        self.other_sheets.insert(self.active_sheet_index, prev_active);
+        self.other_sheets.insert(insert_at, new_sheet);
+        self.sheet = self.other_sheets.remove(insert_at);
+        self.active_sheet_index = insert_at;
+        self.hidden_rows.clear();
+        self.selection_anchor = None;
+        self.cursor_col = 0; self.cursor_row = 0;
+        self.view_col = 0; self.view_row = 0;
+        n
+    }
+
+    /// Delete the active sheet. If it's the only sheet, the call is ignored
+    /// (workbook must always have at least one sheet).
+    pub fn delete_active_sheet(&mut self) -> bool {
+        if self.sheet_count() <= 1 { return false; }
+        // Take the next sheet (or previous if active is last) as new active.
+        let new_active_index = if self.active_sheet_index < self.other_sheets.len() {
+            self.active_sheet_index
+        } else {
+            self.active_sheet_index - 1
+        };
+        let new_active = self.other_sheets.remove(new_active_index);
+        self.sheet = new_active;
+        self.active_sheet_index = new_active_index;
+        self.hidden_rows.clear();
+        self.selection_anchor = None;
+        self.cursor_col = 0; self.cursor_row = 0;
+        self.view_col = 0; self.view_row = 0;
+        true
+    }
+
+    /// Rename the active sheet. Returns false if `new_name` clashes with
+    /// an existing sheet name (case-insensitive).
+    pub fn rename_active_sheet(&mut self, new_name: &str) -> bool {
+        let new_name = new_name.trim();
+        if new_name.is_empty() { return false; }
+        let lower = new_name.to_lowercase();
+        for s in &self.other_sheets {
+            if s.name.to_lowercase() == lower { return false; }
+        }
+        self.sheet.name = new_name.to_string();
+        true
     }
 
     pub fn save_undo(&mut self) {
@@ -179,7 +369,24 @@ impl App {
             self.selection_anchor = None;
         }
         let new_col = (self.cursor_col as isize + dx).max(0).min(255) as usize;
-        let new_row = (self.cursor_row as isize + dy).max(0).min(9999) as usize;
+        let mut new_row = (self.cursor_row as isize + dy).max(0).min(9999) as usize;
+        // When a filter is active, walking +/- 1 row should skip hidden rows.
+        // For multi-step vertical jumps we still respect the visible-row
+        // count, so PageUp/PageDown move by `dy` *visible* rows.
+        if !self.hidden_rows.is_empty() && dy != 0 {
+            let dir: isize = if dy > 0 { 1 } else { -1 };
+            let mut remaining = dy.abs();
+            let mut r = self.cursor_row as isize;
+            while remaining > 0 {
+                r += dir;
+                if r < 0 { r = 0; break; }
+                if r > 9999 { r = 9999; break; }
+                if !self.hidden_rows.contains(&(r as usize)) {
+                    remaining -= 1;
+                }
+            }
+            new_row = r.max(0).min(9999) as usize;
+        }
         self.cursor_col = new_col;
         self.cursor_row = new_row;
         self.adjust_view();
@@ -198,7 +405,9 @@ impl App {
 
         let (term_width, term_height) = terminal::size().unwrap_or((80, 24));
         let available_width = (term_width as usize).saturating_sub(ROW_LABEL_WIDTH);
-        let visible_rows = (term_height as usize).saturating_sub(HEADER_ROWS + FOOTER_ROWS);
+        // When the tab bar is visible we lose one more row.
+        let tab_rows = if self.sheet_count() > 1 { 1 } else { 0 };
+        let visible_rows = (term_height as usize).saturating_sub(HEADER_ROWS + FOOTER_ROWS + tab_rows);
 
         if self.cursor_col < self.view_col {
             self.view_col = self.cursor_col;
@@ -240,7 +449,8 @@ impl App {
         let screen_row = screen_row as usize;
 
         let (term_width, term_height) = terminal::size().unwrap_or((80, 24));
-        let grid_height = (term_height as usize).saturating_sub(HEADER_ROWS + 2);
+        let tab_rows = if self.sheet_count() > 1 { 1 } else { 0 };
+        let grid_height = (term_height as usize).saturating_sub(HEADER_ROWS + 2 + tab_rows);
 
         if screen_col < ROW_LABEL_WIDTH || screen_row < HEADER_ROWS {
             return None;
@@ -255,13 +465,47 @@ impl App {
         while x < term_width as usize && col <= 255 {
             let col_width = self.sheet.get_col_width(col);
             if screen_col < x + col_width {
-                let row = self.view_row + (screen_row - HEADER_ROWS);
-                return Some((col, row));
+                // Map the on-screen row offset back to a logical row,
+                // skipping any rows hidden by an active filter.
+                let target_offset = screen_row - HEADER_ROWS;
+                let mut logical = self.view_row;
+                let mut visible_seen = 0usize;
+                while logical < 10000 {
+                    if !self.hidden_rows.contains(&logical) {
+                        if visible_seen == target_offset {
+                            return Some((col, logical));
+                        }
+                        visible_seen += 1;
+                    }
+                    logical += 1;
+                }
+                return None;
             }
             x += col_width;
             col += 1;
         }
 
+        None
+    }
+
+    /// If the click landed on a sheet tab in the tab bar, return that tab's
+    /// workbook-order index. The tab bar lives at screen row `term_height-3`
+    /// when the workbook has more than one sheet.
+    pub fn screen_to_sheet_tab(&self, screen_col: u16, screen_row: u16) -> Option<usize> {
+        if self.sheet_count() <= 1 { return None; }
+        let (_, term_height) = terminal::size().unwrap_or((80, 24));
+        if screen_row != term_height.saturating_sub(3) { return None; }
+        // Mirror the layout used by draw_sheet_tabs: " name " segments
+        // separated by single spaces.
+        let mut x = 0u16;
+        for (idx, sheet) in self.workbook_sheets().iter().enumerate() {
+            use unicode_width::UnicodeWidthStr;
+            let label_width = UnicodeWidthStr::width(format!(" {} ", sheet.name).as_str()) as u16;
+            if screen_col >= x && screen_col < x + label_width {
+                return Some(idx);
+            }
+            x += label_width + 1; // +1 for the inter-tab space
+        }
         None
     }
 
@@ -704,42 +948,34 @@ impl App {
                 self.status_message = "新規シート".to_string();
             }
             Action::FileOpen => {
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::Open,
-                    label: "開くファイル名".to_string(),
-                    input: String::new(),
-                });
+                self.dialog = Some(Dialog::single(DialogKind::Open, "開くファイル名", ""));
                 self.mode = Mode::Dialog;
             }
             Action::FileSave => {
                 if let Some(filename) = self.current_file.clone() {
+                    // Filters are session-only; clear before save so the file
+                    // doesn't capture hidden state and the user sees the full
+                    // sheet again after the save.
+                    self.hidden_rows.clear();
                     commands::save_to_file(self, &filename);
                 } else {
                     self.dispatch(Action::FileSaveAs);
                 }
             }
             Action::FileSaveAs => {
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::SaveAs,
-                    label: "保存ファイル名".to_string(),
-                    input: self.current_file.clone().unwrap_or_default(),
-                });
+                self.dialog = Some(Dialog::single(
+                    DialogKind::SaveAs,
+                    "保存ファイル名",
+                    self.current_file.clone().unwrap_or_default(),
+                ));
                 self.mode = Mode::Dialog;
             }
             Action::FileImportCsv => {
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::ImportCsv,
-                    label: "CSVファイル名".to_string(),
-                    input: String::new(),
-                });
+                self.dialog = Some(Dialog::single(DialogKind::ImportCsv, "CSVファイル名", ""));
                 self.mode = Mode::Dialog;
             }
             Action::FileExportCsv => {
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::ExportCsv,
-                    label: "エクスポート先".to_string(),
-                    input: String::new(),
-                });
+                self.dialog = Some(Dialog::single(DialogKind::ExportCsv, "エクスポート先", ""));
                 self.mode = Mode::Dialog;
             }
             Action::FilePrintHtml => {
@@ -751,11 +987,11 @@ impl App {
                     }
                     None => "sheet.html".to_string(),
                 };
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::PrintHtml,
-                    label: "出力先 HTML (保存後ブラウザで開きます)".to_string(),
-                    input: default_name,
-                });
+                self.dialog = Some(Dialog::single(
+                    DialogKind::PrintHtml,
+                    "出力先 HTML (保存後ブラウザで開きます)",
+                    default_name,
+                ));
                 self.mode = Mode::Dialog;
             }
             Action::FileQuit => {
@@ -769,19 +1005,18 @@ impl App {
             Action::EditClear => self.clear_target(),
             Action::EditSelectAll => self.select_all(),
             Action::EditFind => {
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::Find,
-                    label: "検索".to_string(),
-                    input: self.last_search.clone(),
-                });
+                self.dialog = Some(Dialog::single(DialogKind::Find, "検索", self.last_search.clone()));
                 self.mode = Mode::Dialog;
             }
             Action::EditGoto => {
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::Goto,
-                    label: "ジャンプ先セル (例: A1)".to_string(),
-                    input: String::new(),
-                });
+                self.dialog = Some(Dialog::single(DialogKind::Goto, "ジャンプ先セル (例: A1)", ""));
+                self.mode = Mode::Dialog;
+            }
+            Action::EditReplace => {
+                self.dialog = Some(Dialog::multi(DialogKind::Replace, vec![
+                    DialogField { label: "検索 (find)".into(), input: self.last_search.clone() },
+                    DialogField { label: "置換 (replace)".into(), input: self.last_replace.clone() },
+                ]));
                 self.mode = Mode::Dialog;
             }
             Action::EditFindNext => {
@@ -822,6 +1057,64 @@ impl App {
                 self.sheet.delete_col(self.cursor_col);
                 self.status_message = format!("列 {} を削除", crate::formula::col_to_name(self.cursor_col));
             }
+            Action::DataSort => {
+                let col = crate::formula::col_to_name(self.cursor_col);
+                self.dialog = Some(Dialog::multi(DialogKind::Sort, vec![
+                    DialogField { label: "並べ替え列 (例: B)".into(), input: col },
+                    DialogField { label: "順序 (asc / desc)".into(), input: "asc".into() },
+                    DialogField { label: "ヘッダー行を含む (y / n)".into(), input: "y".into() },
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::DataFilter => {
+                let col = crate::formula::col_to_name(self.cursor_col);
+                self.dialog = Some(Dialog::multi(DialogKind::Filter, vec![
+                    DialogField { label: "フィルター対象列 (例: B)".into(), input: col },
+                    DialogField { label: "条件 (例: >100, =\"east\", *abc*)".into(), input: String::new() },
+                    DialogField { label: "ヘッダー行を含む (y / n)".into(), input: "y".into() },
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::SheetNew => {
+                let name = self.add_sheet(None);
+                self.status_message = format!("新規シート: {}", name);
+            }
+            Action::SheetDelete => {
+                let prev = self.sheet.name.clone();
+                if self.delete_active_sheet() {
+                    self.status_message = format!("シート削除: {} (現在のシート: {})", prev, self.sheet.name);
+                } else {
+                    self.status_message = "最後のシートは削除できません".to_string();
+                }
+            }
+            Action::SheetRename => {
+                self.dialog = Some(Dialog::single(
+                    DialogKind::SheetRename,
+                    format!("シート名変更 ({} -> ?)", self.sheet.name),
+                    self.sheet.name.clone(),
+                ));
+                self.mode = Mode::Dialog;
+            }
+            Action::SheetNext => {
+                let next = (self.active_sheet_index + 1) % self.sheet_count();
+                self.switch_sheet(next);
+                self.status_message = format!("シート: {}", self.sheet.name);
+            }
+            Action::SheetPrev => {
+                let total = self.sheet_count();
+                let prev = (self.active_sheet_index + total - 1) % total;
+                self.switch_sheet(prev);
+                self.status_message = format!("シート: {}", self.sheet.name);
+            }
+            Action::DataFilterClear => {
+                let n = self.hidden_rows.len();
+                self.hidden_rows.clear();
+                self.status_message = if n == 0 {
+                    "フィルター解除済み".to_string()
+                } else {
+                    format!("フィルター解除: {} 行を再表示", n)
+                };
+            }
             Action::FormatAutoWidth => {
                 commands::autowidth_all(self);
             }
@@ -835,14 +1128,91 @@ impl App {
                 let w = self.sheet.get_col_width(self.cursor_col);
                 self.status_message = format!("列幅: {}", w);
             }
+            Action::FormatBoldToggle => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                // Toggle based on the anchor cell's current state.
+                let anchor_bold = self.sheet.get_cell(min_c, min_r).bold;
+                let new_bold = !anchor_bold;
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.bold = new_bold);
+                self.status_message = if new_bold { "太字 ON".into() } else { "太字 OFF".into() };
+            }
+            Action::FormatAlignLeft | Action::FormatAlignCenter
+            | Action::FormatAlignRight | Action::FormatAlignDefault => {
+                let align = match action {
+                    Action::FormatAlignLeft => crate::cell::Alignment::Left,
+                    Action::FormatAlignCenter => crate::cell::Alignment::Center,
+                    Action::FormatAlignRight => crate::cell::Alignment::Right,
+                    _ => crate::cell::Alignment::Default,
+                };
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.alignment = align);
+                self.status_message = format!("揃え: {:?}", align);
+            }
+            Action::FormatTextColor => {
+                self.dialog = Some(Dialog::single(
+                    DialogKind::TextColor,
+                    "文字色 RGB (例: 255,255,255 または #ffffff、空でクリア)",
+                    String::new(),
+                ));
+                self.mode = Mode::Dialog;
+            }
+            Action::FormatBgColor => {
+                self.dialog = Some(Dialog::single(
+                    DialogKind::BgColor,
+                    "背景色 RGB (例: 255,235,150 または #fff、空でクリア)",
+                    String::new(),
+                ));
+                self.mode = Mode::Dialog;
+            }
+            Action::FormatNumber => {
+                self.dialog = Some(Dialog::multi(DialogKind::NumberFormat, vec![
+                    DialogField { label: "種別 (general/number/currency/percent/scientific/date/text)".into(), input: "number".into() },
+                    DialogField { label: "小数桁数 (0-10)".into(), input: "2".into() },
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::FormatClear => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| {
+                    c.alignment = crate::cell::Alignment::Default;
+                    c.bold = false;
+                    c.text_color = None;
+                    c.bg_color = None;
+                    c.format = crate::cell::DisplayFormat::General;
+                });
+                self.status_message = "書式をクリアしました".into();
+            }
+            Action::FormatConditional => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                let range = format!(
+                    "{}:{}",
+                    crate::formula::cell_name(min_c, min_r),
+                    crate::formula::cell_name(max_c, max_r),
+                );
+                self.dialog = Some(Dialog::multi(DialogKind::ConditionalAdd, vec![
+                    DialogField { label: "対象範囲 (例: A1:B10)".into(), input: range },
+                    DialogField { label: "条件 (例: >100, <=0, =\"NG\", scale:0-100)".into(), input: ">0".into() },
+                    DialogField { label: "背景色 RGB (例: 255,200,200 または #fee)".into(), input: "255,200,200".into() },
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::FormatConditionalClear => {
+                let n = self.sheet.conditional_formats.len();
+                if n > 0 { self.save_undo(); }
+                self.sheet.conditional_formats.clear();
+                self.status_message = format!("条件付き書式 {} 件を削除", n);
+            }
             Action::FormatSetWidth => {
                 let cur = self.sheet.get_col_width(self.cursor_col);
                 let col_name = crate::formula::col_to_name(self.cursor_col);
-                self.dialog = Some(Dialog {
-                    kind: DialogKind::SetColWidth,
-                    label: format!("列 {} の幅 (3-50)", col_name),
-                    input: cur.to_string(),
-                });
+                self.dialog = Some(Dialog::single(
+                    DialogKind::SetColWidth,
+                    format!("列 {} の幅 (3-50)", col_name),
+                    cur.to_string(),
+                ));
                 self.mode = Mode::Dialog;
             }
             Action::HelpKeys => {
@@ -857,7 +1227,7 @@ impl App {
     /// Execute a dialog action with the current input.
     pub fn commit_dialog(&mut self) {
         let Some(dialog) = self.dialog.clone() else { return; };
-        let input = dialog.input.trim().to_string();
+        let input = dialog.primary_input().trim().to_string();
 
         match dialog.kind {
             DialogKind::Open => {
@@ -869,6 +1239,7 @@ impl App {
             DialogKind::SaveAs => {
                 let input = commands::sanitize_path_input(&input);
                 if !input.is_empty() {
+                    self.hidden_rows.clear();
                     commands::save_to_file(self, &input);
                 }
             }
@@ -924,11 +1295,242 @@ impl App {
                     commands::export_html_file(self, &input);
                 }
             }
+            DialogKind::Sort => {
+                let col_in = dialog.fields.get(0).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let dir_in = dialog.fields.get(1).map(|f| f.input.trim().to_lowercase()).unwrap_or_else(|| "asc".into());
+                let hdr_in = dialog.fields.get(2).map(|f| f.input.trim().to_lowercase()).unwrap_or_else(|| "y".into());
+                let col = match crate::formula::col_from_name(&col_in) {
+                    Some(c) => c,
+                    None => {
+                        self.status_message = format!("無効な列名: {}", col_in);
+                        self.dialog = None;
+                        self.mode = Mode::Normal;
+                        return;
+                    }
+                };
+                let descending = dir_in.starts_with('d');
+                let header = matches!(hdr_in.as_str(), "y" | "yes" | "true" | "t" | "1");
+                let n = commands::sort_rows(self, col, descending, header);
+                self.status_message = format!(
+                    "列 {} で{}並べ替え: {} 行を並べ替え{}",
+                    crate::formula::col_to_name(col),
+                    if descending { "降順" } else { "昇順" },
+                    n,
+                    if header { "（先頭行はヘッダーとして固定）" } else { "" },
+                );
+            }
+            DialogKind::Filter => {
+                let col_in = dialog.fields.get(0).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let crit = dialog.fields.get(1).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let hdr_in = dialog.fields.get(2).map(|f| f.input.trim().to_lowercase()).unwrap_or_else(|| "y".into());
+                let col = match crate::formula::col_from_name(&col_in) {
+                    Some(c) => c,
+                    None => {
+                        self.status_message = format!("無効な列名: {}", col_in);
+                        self.dialog = None;
+                        self.mode = Mode::Normal;
+                        return;
+                    }
+                };
+                let header = matches!(hdr_in.as_str(), "y" | "yes" | "true" | "t" | "1");
+                let hidden = commands::apply_filter(self, col, &crit, header);
+                self.status_message = format!(
+                    "列 {} でフィルター: {} 行を非表示",
+                    crate::formula::col_to_name(col),
+                    hidden
+                );
+            }
+            DialogKind::TextColor => {
+                let parsed = if input.is_empty() { Some(None) } else { parse_rgb_input(&input).map(Some) };
+                if let Some(color) = parsed {
+                    let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                    self.save_undo();
+                    self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.text_color = color);
+                    self.status_message = if color.is_some() {
+                        format!("文字色: {:?}", color.unwrap())
+                    } else { "文字色をクリア".into() };
+                } else {
+                    self.status_message = "色の指定が無効です（例: 255,255,255 または #fff）".into();
+                }
+            }
+            DialogKind::BgColor => {
+                let parsed = if input.is_empty() { Some(None) } else { parse_rgb_input(&input).map(Some) };
+                if let Some(color) = parsed {
+                    let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                    self.save_undo();
+                    self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.bg_color = color);
+                    self.status_message = if color.is_some() {
+                        format!("背景色: {:?}", color.unwrap())
+                    } else { "背景色をクリア".into() };
+                } else {
+                    self.status_message = "色の指定が無効です（例: 255,235,150 または #fff）".into();
+                }
+            }
+            DialogKind::NumberFormat => {
+                let kind_in = dialog.fields.get(0).map(|f| f.input.trim().to_lowercase()).unwrap_or_default();
+                let dec_in = dialog.fields.get(1).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let dec: usize = dec_in.parse().unwrap_or(2).min(10);
+                let fmt = match kind_in.as_str() {
+                    "general" => crate::cell::DisplayFormat::General,
+                    "number" => crate::cell::DisplayFormat::Number(dec),
+                    "currency" => crate::cell::DisplayFormat::Currency(dec),
+                    "percent" | "%" => crate::cell::DisplayFormat::Percent(dec),
+                    "scientific" | "sci" => crate::cell::DisplayFormat::Scientific,
+                    "date" => crate::cell::DisplayFormat::Date,
+                    "text" => crate::cell::DisplayFormat::Text,
+                    _ => {
+                        self.status_message = format!("未知の書式種別: {}", kind_in);
+                        self.dialog = None;
+                        self.mode = Mode::Normal;
+                        return;
+                    }
+                };
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.format = fmt.clone());
+                self.status_message = format!("書式: {:?}", fmt);
+            }
+            DialogKind::ConditionalAdd => {
+                let range_in = dialog.fields.get(0).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let cond_in = dialog.fields.get(1).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let color_in = dialog.fields.get(2).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                match parse_conditional_format(&range_in, &cond_in, &color_in) {
+                    Ok(cf) => {
+                        self.save_undo();
+                        self.sheet.conditional_formats.push(cf);
+                        self.status_message = format!("条件付き書式を追加 ({})", range_in);
+                    }
+                    Err(e) => {
+                        self.status_message = format!("条件付き書式エラー: {}", e);
+                    }
+                }
+            }
+            DialogKind::SheetRename => {
+                if input.is_empty() {
+                    self.status_message = "シート名を入力してください".to_string();
+                } else if self.rename_active_sheet(&input) {
+                    self.status_message = format!("シート名を {} に変更", input);
+                } else {
+                    self.status_message = format!("{} は既に使われています", input);
+                }
+            }
+            DialogKind::Replace => {
+                // Replace cares about exact strings (incl. whitespace), so
+                // we read the raw field inputs rather than the trimmed primary.
+                let find = dialog.fields.get(0).map(|f| f.input.clone()).unwrap_or_default();
+                let replace = dialog.fields.get(1).map(|f| f.input.clone()).unwrap_or_default();
+                if find.is_empty() {
+                    self.status_message = "検索文字列を入力してください".to_string();
+                } else {
+                    self.last_search = find.clone();
+                    self.last_replace = replace.clone();
+                    let count = commands::replace_all(self, &find, &replace);
+                    self.status_message = if count == 0 {
+                        format!("該当なし: {:?}", find)
+                    } else {
+                        format!("{} 件置換しました", count)
+                    };
+                }
+            }
         }
 
         self.dialog = None;
         self.mode = Mode::Normal;
     }
+}
+
+/// Parse an RGB color string in any of these forms:
+/// - `255,128,64` (comma-separated decimals, each 0-255)
+/// - `#rrggbb` (6-hex with optional leading `#`)
+/// - `#rgb` (3-hex shorthand, each digit doubled)
+fn parse_rgb_input(s: &str) -> Option<crate::cell::RgbColor> {
+    let s = s.trim();
+    if s.is_empty() { return None; }
+    // Hex form.
+    let hex = s.trim_start_matches('#');
+    if hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        if hex.len() == 6 {
+            let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+            let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+            let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+            return Some((r, g, b));
+        }
+        if hex.len() == 3 {
+            let r = u8::from_str_radix(&hex[0..1], 16).ok()? * 0x11;
+            let g = u8::from_str_radix(&hex[1..2], 16).ok()? * 0x11;
+            let b = u8::from_str_radix(&hex[2..3], 16).ok()? * 0x11;
+            return Some((r, g, b));
+        }
+    }
+    // Decimal "r,g,b" form.
+    let parts: Vec<&str> = s.split(',').map(|p| p.trim()).collect();
+    if parts.len() == 3 {
+        let r: u8 = parts[0].parse().ok()?;
+        let g: u8 = parts[1].parse().ok()?;
+        let b: u8 = parts[2].parse().ok()?;
+        return Some((r, g, b));
+    }
+    None
+}
+
+/// Parse a conditional-formatting rule from the dialog inputs. Accepted
+/// condition forms:
+/// - Comparison: `>100`, `<-5`, `>=0`, `<=100`, `=42`, `<>0`
+/// - Color scale: `scale:0-100`, `scale:0..100,blue,red`
+fn parse_conditional_format(range_in: &str, cond_in: &str, color_in: &str)
+    -> std::result::Result<crate::sheet::ConditionalFormat, String>
+{
+    // Range A1:B10 or single cell A1
+    let (min_col, min_row, max_col, max_row) = if let Some((a, b)) = range_in.split_once(':') {
+        let (c1, r1, _, _) = crate::formula::parse_cell_ref(a.trim())
+            .ok_or_else(|| format!("無効な範囲: {}", range_in))?;
+        let (c2, r2, _, _) = crate::formula::parse_cell_ref(b.trim())
+            .ok_or_else(|| format!("無効な範囲: {}", range_in))?;
+        (c1.min(c2), r1.min(r2), c1.max(c2), r1.max(r2))
+    } else {
+        let (c, r, _, _) = crate::formula::parse_cell_ref(range_in.trim())
+            .ok_or_else(|| format!("無効な範囲: {}", range_in))?;
+        (c, r, c, r)
+    };
+
+    let cond_trim = cond_in.trim();
+    let condition = if let Some(rest) = cond_trim.strip_prefix("scale:") {
+        // scale:min-max[,min_color,max_color]
+        let mut parts = rest.split(',');
+        let range_part = parts.next().ok_or("scale: にレンジが必要")?;
+        let (min_s, max_s) = range_part.split_once('-').or_else(|| range_part.split_once(".."))
+            .ok_or("scale: は min-max 形式")?;
+        let min: f64 = min_s.trim().parse().map_err(|_| "scale min が数値ではありません")?;
+        let max: f64 = max_s.trim().parse().map_err(|_| "scale max が数値ではありません")?;
+        let mc1 = parts.next().and_then(|s| parse_rgb_input(s.trim()))
+            .unwrap_or((255, 245, 235));
+        let mc2 = parts.next().and_then(|s| parse_rgb_input(s.trim()))
+            .unwrap_or((220, 60, 60));
+        crate::sheet::CondCondition::ColorScale { min, max, min_color: mc1, max_color: mc2 }
+    } else {
+        let (op, num_str) = if let Some(rest) = cond_trim.strip_prefix(">=") { (crate::sheet::CondOp::Ge, rest) }
+            else if let Some(rest) = cond_trim.strip_prefix("<=") { (crate::sheet::CondOp::Le, rest) }
+            else if let Some(rest) = cond_trim.strip_prefix("<>") { (crate::sheet::CondOp::Ne, rest) }
+            else if let Some(rest) = cond_trim.strip_prefix("!=") { (crate::sheet::CondOp::Ne, rest) }
+            else if let Some(rest) = cond_trim.strip_prefix('>') { (crate::sheet::CondOp::Gt, rest) }
+            else if let Some(rest) = cond_trim.strip_prefix('<') { (crate::sheet::CondOp::Lt, rest) }
+            else if let Some(rest) = cond_trim.strip_prefix('=') { (crate::sheet::CondOp::Eq, rest) }
+            else { return Err(format!("条件の演算子が必要: {}", cond_trim)); };
+        let target: f64 = num_str.trim().trim_matches('"').parse()
+            .map_err(|_| format!("数値が必要: {}", num_str))?;
+        crate::sheet::CondCondition::Compare { op, target }
+    };
+
+    let bg_color = if color_in.is_empty() { None } else { parse_rgb_input(color_in) };
+    if !color_in.is_empty() && bg_color.is_none() {
+        return Err(format!("色の指定が無効: {}", color_in));
+    }
+    Ok(crate::sheet::ConditionalFormat {
+        min_col, min_row, max_col, max_row,
+        condition,
+        text_color: None,
+        bg_color,
+    })
 }
 
 /// Return true if the given cell holds a number (or a formula that evaluates
@@ -1167,6 +1769,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             KeyCode::Char('p') | KeyCode::Char('P') => { app.dispatch(Action::FilePrintHtml); return; }
             KeyCode::Char('f') | KeyCode::Char('F') => { app.dispatch(Action::EditFind); return; }
             KeyCode::Char('g') | KeyCode::Char('G') => { app.dispatch(Action::EditGoto); return; }
+            KeyCode::Char('r') | KeyCode::Char('R') => { app.dispatch(Action::EditReplace); return; }
+            KeyCode::Char('b') | KeyCode::Char('B') => { app.dispatch(Action::FormatBoldToggle); return; }
             KeyCode::Char('a') | KeyCode::Char('A') => { app.dispatch(Action::EditSelectAll); return; }
             // Vim-style cell movement with Ctrl modifier (hjkl).
             // Shift extends the selection (same semantics as Shift+arrow).
@@ -1200,6 +1804,8 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             KeyCode::Left => { move_to_data_edge(app, -1, 0, shift); return; }
             KeyCode::Down => { move_to_data_edge(app, 0, 1, shift); return; }
             KeyCode::Up => { move_to_data_edge(app, 0, -1, shift); return; }
+            KeyCode::PageDown => { app.dispatch(Action::SheetNext); return; }
+            KeyCode::PageUp => { app.dispatch(Action::SheetPrev); return; }
             _ => {}
         }
     }
@@ -1523,15 +2129,25 @@ fn handle_dialog_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             app.commit_dialog();
         }
+        KeyCode::Tab => {
+            if let Some(d) = app.dialog.as_mut() {
+                if d.fields.len() > 1 { d.next_field(); }
+            }
+        }
+        KeyCode::BackTab => {
+            if let Some(d) = app.dialog.as_mut() {
+                if d.fields.len() > 1 { d.prev_field(); }
+            }
+        }
         KeyCode::Backspace => {
             if let Some(d) = app.dialog.as_mut() {
-                d.input.pop();
+                d.current_input_mut().pop();
             }
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                 if let Some(d) = app.dialog.as_mut() {
-                    d.input.push(c);
+                    d.current_input_mut().push(c);
                 }
             }
         }
@@ -1635,6 +2251,13 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
 
     match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) => {
+            // Sheet tab click → switch sheet.
+            if let Some(target) = app.screen_to_sheet_tab(col, row) {
+                if app.mode == Mode::Edit { app.commit_edit(); app.mode = Mode::Normal; }
+                app.switch_sheet(target);
+                app.status_message = format!("シート: {}", app.sheet.name);
+                return;
+            }
             // Column-width resize handle on the header row takes precedence
             // over cell selection / menu opening.
             if let Some(rcol) = app.screen_to_col_edge(col, row) {

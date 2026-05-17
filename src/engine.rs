@@ -7,12 +7,23 @@ use crate::formula;
 
 pub struct Engine<'a> {
     cells: &'a HashMap<(usize, usize), Cell>,
+    /// Optional lookup of other sheets in the workbook by name → cells.
+    /// When present, references like `Sheet2!A1` resolve against this map;
+    /// when absent, cross-sheet references return `#REF!`.
+    other_sheets: Option<&'a [(String, &'a HashMap<(usize, usize), Cell>)]>,
     eval_stack: HashSet<(usize, usize)>,
 }
 
 impl<'a> Engine<'a> {
     pub fn new(cells: &'a HashMap<(usize, usize), Cell>) -> Self {
-        Engine { cells, eval_stack: HashSet::new() }
+        Engine { cells, other_sheets: None, eval_stack: HashSet::new() }
+    }
+
+    pub fn with_workbook(
+        cells: &'a HashMap<(usize, usize), Cell>,
+        other_sheets: &'a [(String, &'a HashMap<(usize, usize), Cell>)],
+    ) -> Self {
+        Engine { cells, other_sheets: Some(other_sheets), eval_stack: HashSet::new() }
     }
 
     pub fn evaluate_formula(&mut self, formula_str: &str) -> Result<CellValue, String> {
@@ -105,10 +116,35 @@ impl<'a> Engine<'a> {
         }
         if expr.eq_ignore_ascii_case("TRUE") { return Ok(CellValue::Boolean(true)); }
         if expr.eq_ignore_ascii_case("FALSE") { return Ok(CellValue::Boolean(false)); }
+        // Cross-sheet reference: `SheetName!CellRef` (e.g. Sheet2!A1).
+        // Sheet name may be quoted with single quotes if it contains spaces.
+        // Foreign cells are evaluated with a fresh sub-engine that has *no*
+        // workbook context — i.e. cross-sheet refs in the foreign cell return
+        // `#REF!`. This keeps cycle prevention simple at the cost of only
+        // supporting one level of indirection per formula.
+        if let Some(bang) = expr.find('!') {
+            let sheet_name_raw = &expr[..bang];
+            let cell_ref = &expr[bang + 1..];
+            let sheet_name = sheet_name_raw.trim().trim_matches('\'');
+            if let Some(other_cells) = self.lookup_sheet(sheet_name) {
+                if let Some((col, row, _, _)) = formula::parse_cell_ref(cell_ref) {
+                    let mut e = Engine::new(other_cells);
+                    return e.evaluate_cell(col, row);
+                }
+            }
+            return Ok(CellValue::Error(CellError::Ref));
+        }
         if let Some((col, row, _, _)) = formula::parse_cell_ref(expr) {
             return self.evaluate_cell(col, row);
         }
         Err("#NAME?".to_string())
+    }
+
+    fn lookup_sheet(&self, name: &str) -> Option<&'a HashMap<(usize, usize), Cell>> {
+        let lower = name.to_lowercase();
+        self.other_sheets?.iter()
+            .find(|(n, _)| n.to_lowercase() == lower)
+            .map(|(_, cells)| *cells)
     }
 
     fn try_function(&mut self, expr: &str) -> Result<Option<CellValue>, String> {
@@ -1494,6 +1530,33 @@ mod tests {
         assert_eq!(n(eval(&m, "=LCM(4, 6)")), 12.0);
         assert_eq!(n(eval(&m, "=FACT(5)")), 120.0);
         assert_eq!(n(eval(&m, "=FACT(0)")), 1.0);
+    }
+
+    #[test]
+    fn cross_sheet_reference() {
+        // Build two sheets via raw cell maps so we can pass them to the
+        // engine's workbook constructor directly.
+        let mut s2_cells: HashMap<(usize, usize), Cell> = HashMap::new();
+        s2_cells.insert((0, 0), Cell::new("100".into(), CellValue::Number(100.0)));
+        s2_cells.insert((0, 1), Cell::new("200".into(), CellValue::Number(200.0)));
+
+        let mut s1_cells: HashMap<(usize, usize), Cell> = HashMap::new();
+        s1_cells.insert((0, 0), Cell::new("1".into(), CellValue::Number(1.0)));
+
+        let others = [("Sheet2".to_string(), &s2_cells)];
+        let mut e = Engine::with_workbook(&s1_cells, &others);
+        let v = e.evaluate_formula("=Sheet2!A1 + Sheet2!A2").unwrap();
+        if let CellValue::Number(n) = v {
+            assert_eq!(n, 300.0);
+        } else { panic!("expected number, got {:?}", v); }
+
+        // Case insensitive sheet name lookup
+        let v = e.evaluate_formula("=sheet2!A1").unwrap();
+        assert!(matches!(v, CellValue::Number(n) if n == 100.0));
+
+        // Missing sheet → #REF!
+        let v = e.evaluate_formula("=Bogus!A1").unwrap();
+        assert!(matches!(v, CellValue::Error(CellError::Ref)));
     }
 
     #[test]

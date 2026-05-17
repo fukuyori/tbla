@@ -75,6 +75,7 @@ tbla data.csv
 | `Ctrl+Home` | Go to A1 |
 | `Ctrl+End` | Go to the last cell with data |
 | `Ctrl+↑` `↓` `←` `→` | Jump to next data edge |
+| `Ctrl+PgUp` / `Ctrl+PgDn` | Previous / next sheet |
 | `Shift+arrow` | Extend selection |
 | `Ctrl+A` | Select all |
 | `Ctrl+H` / `Ctrl+J` / `Ctrl+K` / `Ctrl+L` | Left / Down / Up / Right (vim-style home-row) |
@@ -161,12 +162,13 @@ range in darker blue).
 | `Ctrl+X` | Cut |
 | `Ctrl+V` | Paste |
 
-### Search
+### Search / Replace
 
 | Key | Action |
 |-----|--------|
 | `Ctrl+F` | Find |
 | `F3` | Find next |
+| `Ctrl+R` | Replace (Tab cycles find / replace fields) |
 | `Ctrl+G` | Go to cell |
 
 ### Menu
@@ -236,7 +238,9 @@ double-click the cell to start editing.
 - **File**: New, Open, Save, Save As, CSV Import/Export, Print (HTML), Quit
 - **Edit**: Undo, Redo, Cut, Copy, Paste, Clear, Select All, Find, Find Next, Go To
 - **Insert**: Insert Row/Column, Delete Row/Column
-- **Format**: Auto-fit column width, Widen / Narrow column, Set width (numeric input)
+- **Sheet**: New sheet, Rename, Delete, Next sheet, Previous sheet
+- **Data**: Sort…, Filter…, Clear filter
+- **Format**: Auto-fit / Widen / Narrow / Set column width, Bold toggle, Left/Center/Right align, Text color, Background color, Number format…, Clear formatting, Conditional formatting…
 - **Help**: Key reference, About
 
 ## Supported Functions
@@ -288,6 +292,112 @@ years → `=PMT(0.05/12, 360, 100000)` ≈ -536.82.
 
 ### Information
 `ISBLANK`, `ISNUMBER`, `ISTEXT`
+
+## Data Operations
+
+### Sort
+
+`Data → Sort…` opens a three-field dialog:
+
+| Field | Value |
+|-------|-------|
+| Sort column | Column letter (defaults to cursor column) |
+| Order | `asc` (default) or `desc` |
+| Header row | `y` to pin the first row (default), `n` to sort everything |
+
+Numbers sort numerically; strings sort case-insensitively; empty cells go
+last in ascending order. **Caveat**: formulas inside the sort range are
+*compared* by their value but their references are NOT rewritten when rows
+move. Same-row relative references (e.g. `=A1+B1`) stay correct;
+absolute-row references can break.
+
+### Filter
+
+`Data → Filter…` hides rows whose value in the filter column doesn't match.
+
+| Syntax | Example |
+|--------|---------|
+| Equality | `100` or `=fruit` |
+| Comparison | `>10` `<=100` `<>0` |
+| Substring | `*example*` (wildcards on both sides) |
+
+`Data → Clear filter` shows all rows again. **Filter state is session-only**
+— it's automatically cleared when you save the file.
+
+### Multi-sheet workbook
+
+| Action | How |
+|--------|-----|
+| `Ctrl+PgDn` / `Ctrl+PgUp` | Next / previous sheet |
+| Click a tab at the bottom | Switch to that sheet |
+| `Sheet → New sheet` | Insert a new sheet after the active one |
+| `Sheet → Rename…` | Rename the active sheet |
+| `Sheet → Delete sheet` | Delete the active sheet (last sheet protected) |
+
+**Cross-sheet references** in formulas:
+
+```
+=Sheet2!A1          # single cell in another sheet
+=SUM(Sheet2!A1:A10) # aggregate a foreign range
+='Sales 2024'!B5    # quote names that contain spaces
+```
+
+Implementation limit: exactly **one level** of indirection is supported.
+A foreign cell can be a literal value or a same-sheet formula, but a
+foreign-sheet formula that itself references a third sheet returns `#REF!`.
+Same-sheet formulas can still nest as deeply as you like.
+
+## Cell & conditional formatting
+
+### Cell formatting (manual)
+
+Applied to the current selection (or the active cell if no selection):
+
+| Action | Effect |
+|--------|--------|
+| `Ctrl+B` | Toggle bold |
+| Format → Left / Center / Right align | Override the auto numeric-right / text-left default |
+| Format → Text color / Background color | RGB dialog (`255,200,200`, `#fee`, `#ffeedd`; empty input clears) |
+| Format → Number format… | Choose general / number / currency / percent / scientific / date / text + decimals |
+| Format → Clear formatting | Reset alignment, bold, colors, number format to defaults |
+
+Formatting **survives value edits** — replacing `100` with `200` keeps the
+cell's bold/colors/alignment/number format.
+
+### Conditional formatting
+
+Rules attached to a sheet are evaluated at render time. Add via
+`Format → Conditional formatting…` (three fields):
+
+| Field | Example |
+|-------|---------|
+| Range | `B2:B100`, or a single cell like `A1` |
+| Condition | `>100` / `<=0` / `=42` / `<>0` or `scale:0-100` |
+| Background color | `255,200,200` or `#fee` |
+
+**Color scale**: write `scale:min-max,minR,minG,minB,maxR,maxG,maxB` — for
+example `scale:0-100,255,255,255,220,50,50` for white → red. Colors are
+interpolated between the two endpoints. Without colors specified, a default
+light-to-red gradient is used.
+
+`Format → Clear conditional formatting` removes every rule on the active
+sheet.
+
+### Persistence
+
+- **Native JSON**: cell formatting (colors, bold, alignment, number format)
+  and per-sheet conditional formats round-trip cleanly.
+- **xlsx write**: cell formatting is emitted via `rust_xlsxwriter::Format`;
+  conditional formatting via `ConditionalFormatCell` /
+  `ConditionalFormat2ColorScale` so the file opens with the same styling
+  in Excel / LibreOffice.
+- **xlsx read**: background color, font color, horizontal alignment, and
+  bold are imported by hand-parsing `xl/styles.xml`. **Conditional
+  formatting is also imported**: `cellIs` comparisons (resolved against
+  `<dxfs>` for colors), `colorScale` (2- or 3-color), and `dataBar`
+  (rendered in tbla as a horizontal bar overlay). Excel files made by
+  others open with colors and conditional rules intact. Borders, italic,
+  underline, font size, and theme/indexed colors are not yet imported.
 
 ## Printing
 

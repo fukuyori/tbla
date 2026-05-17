@@ -44,6 +44,20 @@ pub fn parse_cell_ref(cell_ref: &str) -> Option<(usize, usize, bool, bool)> {
     Some((col, row - 1, col_abs, row_abs))
 }
 
+/// Parse column letters back to a 0-indexed column. Accepts case-insensitive
+/// letters; rejects empty / non-letter input. Inverse of `col_to_name`.
+pub fn col_from_name(name: &str) -> Option<usize> {
+    let name = name.trim();
+    if name.is_empty() { return None; }
+    let mut acc = 0usize;
+    for c in name.chars() {
+        let u = c.to_ascii_uppercase();
+        if !u.is_ascii_alphabetic() { return None; }
+        acc = acc.checked_mul(26)?.checked_add((u as usize) - ('A' as usize) + 1)?;
+    }
+    Some(acc - 1)
+}
+
 /// Convert column index to letters (0 -> A, 25 -> Z, 26 -> AA)
 pub fn col_to_name(col: usize) -> String {
     let mut result = String::new();

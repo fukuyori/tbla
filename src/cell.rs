@@ -53,6 +53,24 @@ impl Default for DisplayFormat {
     }
 }
 
+/// Horizontal alignment of a cell's display value. `Default` means "auto":
+/// numbers right-aligned, text left-aligned. Explicit settings override.
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum Alignment {
+    Default,
+    Left,
+    Center,
+    Right,
+}
+
+impl Default for Alignment {
+    fn default() -> Self { Alignment::Default }
+}
+
+/// Serializable RGB color tuple used for `Cell.text_color` / `Cell.bg_color`.
+/// Stored as `[r, g, b]` integers in JSON.
+pub type RgbColor = (u8, u8, u8);
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Cell {
     pub value: CellValue,
@@ -64,7 +82,20 @@ pub struct Cell {
     /// CellValue so SUM/aggregates can still use it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cached_value: Option<CellValue>,
+    /// Manual cell-format overrides. Each is optional/`Default` so older
+    /// serialized cells round-trip without these fields present.
+    #[serde(default, skip_serializing_if = "is_default_alignment")]
+    pub alignment: Alignment,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub bold: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_color: Option<RgbColor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bg_color: Option<RgbColor>,
 }
+
+fn is_default_alignment(a: &Alignment) -> bool { matches!(a, Alignment::Default) }
+fn is_false(b: &bool) -> bool { !*b }
 
 impl Default for Cell {
     fn default() -> Self {
@@ -73,6 +104,10 @@ impl Default for Cell {
             raw_input: String::new(),
             format: DisplayFormat::General,
             cached_value: None,
+            alignment: Alignment::Default,
+            bold: false,
+            text_color: None,
+            bg_color: None,
         }
     }
 }
@@ -84,12 +119,26 @@ impl Cell {
             raw_input: input,
             format: DisplayFormat::General,
             cached_value: None,
+            alignment: Alignment::Default,
+            bold: false,
+            text_color: None,
+            bg_color: None,
         }
     }
 
     pub fn with_cached(mut self, cached: Option<CellValue>) -> Self {
         self.cached_value = cached;
         self
+    }
+
+    /// True if any non-default formatting is set. Used by serializers to
+    /// skip writing format-only cells when nothing's there.
+    pub fn has_format(&self) -> bool {
+        !matches!(self.format, DisplayFormat::General)
+            || !matches!(self.alignment, Alignment::Default)
+            || self.bold
+            || self.text_color.is_some()
+            || self.bg_color.is_some()
     }
 
     pub fn is_empty(&self) -> bool {

@@ -4,6 +4,80 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.0] - 2026-05-17
+
+### Added — Cell formatting
+- Each cell can carry **alignment** (left/center/right/default), **bold**,
+  **text color** (RGB), **background color** (RGB), and a **number format**
+  (general / number / currency / percent / scientific / date / text).
+- Formatting is **preserved across edits** — overwriting a cell's value
+  keeps its bold / colors / alignment / number format.
+- Menu actions (書式 menu): 太字切替 (`Ctrl+B`), 左/中央/右揃え, 揃え既定,
+  文字色…, 背景色…, 数値書式…, 書式クリア.
+- Color dialogs accept `#rrggbb`, `#rgb`, or `r,g,b` decimal forms;
+  empty input clears the color.
+
+### Added — Conditional formatting
+- **Per-sheet rule list** evaluated at render time.
+- **Comparison**: `>100`, `<-5`, `>=0`, `<=100`, `=42`, `<>0` → set
+  background color when the cell's value matches.
+- **Color scale**: `scale:min-max[,low_color,high_color]` interpolates a
+  two-color gradient across the value range.
+- **Data bar**: a new `DataBar { min, max, bar_color }` rule that draws
+  a horizontal bar inside the cell whose length is proportional to the
+  cell's value within the auto- or explicitly-set min/max. Rendered in
+  the TUI as a background overlay on the value text.
+
+### Added — Persistence (formatting)
+- **JSON native** format v2 carries the new cell-formatting fields and
+  per-sheet `conditional_formats` array; old files round-trip unchanged.
+- **xlsx write**: cell formatting via `rust_xlsxwriter::Format`,
+  conditional formatting (cell rules + 2-color scales + data bars) via
+  the `ConditionalFormat*` API so files open with the same styling in
+  Excel / LibreOffice.
+- **xlsx read**: tbla now imports background color, font color,
+  horizontal alignment, and bold by hand-parsing `xl/styles.xml`. New
+  module `xlsx_styles.rs` (deps `zip` + `quick-xml`, both already in
+  the transitive tree via calamine).
+- **xlsx read — conditional formatting**: each sheet's
+  `<conditionalFormatting>` is parsed, with `<dxfs>` resolved for
+  cell-rule colors. Supported rule types: `cellIs` (mapped to `Compare`),
+  `colorScale` (2- or 3-color → 2-color in tbla), and `dataBar`.
+
+### Added — Data operations
+- **Find & Replace** (`Ctrl+R` or 編集 → 置換…). Two-field dialog (find /
+  replace), Tab cycles focus, case-insensitive substring substitution
+  applied to every cell's raw input.
+- **Row sort** (データ → 並べ替え…). Three-field dialog: column, direction
+  (asc/desc), and whether to keep the first row as a header. Sort treats
+  numbers numerically and strings case-insensitively; empty cells sort
+  last for ascending.
+- **Column filter** (データ → フィルター… / フィルター解除). Hides rows whose
+  filter-column value doesn't match the criteria. Criteria use the same
+  syntax as `COUNTIF` (`>10`, `<>foo`, bare value) plus `*substring*` for
+  contains-match. Filter state is **session-only** — cleared on file save
+  by design.
+
+### Added — Multi-sheet workbook
+- New **シート(S)** menu: 新規シート / シート名変更 / シート削除 / 次のシート (Ctrl+PgDn)
+  / 前のシート (Ctrl+PgUp).
+- **Tab bar** appears at the bottom of the grid when the workbook has
+  more than one sheet; click a tab to switch.
+- **Cross-sheet references**: formulas like `=Sheet2!A1+B1` or
+  `=SUM(Sheet2!A1:A10)`. Sheet names are matched case-insensitively;
+  missing sheets return `#REF!`. (For simplicity, exactly one level of
+  indirection is supported — a foreign cell can be a literal value or a
+  same-sheet formula, but not itself cross-sheet.)
+- **JSON format v2** with `sheets[]` array; v1 single-sheet files still
+  load transparently.
+- **`.xlsx` multi-sheet I/O**: all sheets are read/written in workbook
+  order on open and save (previously only the first sheet).
+
+### Added — Dialog UX
+- Dialog now supports an **arbitrary number of input fields**, with
+  Tab / Shift+Tab cycling focus. Existing single-field dialogs continue
+  to use the simple `Dialog::single` helper.
+
 ## [0.2.2] - 2026-05-17
 
 ### Fixed

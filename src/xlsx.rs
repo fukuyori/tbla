@@ -1,23 +1,23 @@
 use calamine::{open_workbook, Data, Reader, Xlsx};
-use rust_xlsxwriter::{Formula, Workbook};
+use rust_xlsxwriter::{Color as XColor, ConditionalFormat2ColorScale, ConditionalFormatCell, ConditionalFormatCellRule, ConditionalFormatDataBar, Format, FormatAlign, Formula, Workbook};
 use std::path::Path;
 
-use crate::cell::CellValue;
-use crate::sheet::Sheet;
+use crate::cell::{Alignment, Cell, CellValue, DisplayFormat, RgbColor};
+use crate::sheet::{CondCondition, CondOp, ConditionalFormat as CondFmt, Sheet};
 
-/// Result of reading an xlsx file. Carries the loaded sheet plus an optional
-/// warning to surface to the user (e.g., multi-sheet workbooks).
+/// Result of reading an xlsx file. Carries the loaded sheets in workbook
+/// order plus an optional warning to surface to the user.
 pub struct ReadResult {
-    pub sheet: Sheet,
+    pub sheets: Vec<Sheet>,
     pub warning: Option<String>,
 }
 
-/// Read an .xlsx file into a single `Sheet`. If the workbook has multiple
-/// sheets, only the first is loaded and a warning is returned. Formulas
+/// Read an .xlsx file. ALL sheets are loaded in workbook order. Formulas
 /// are preserved as `=…` raw input and their Excel-cached values are
 /// stashed in `Cell::cached_value` so SUM / display continues to work for
 /// functions tbla does not implement.
 pub fn read_xlsx<P: AsRef<Path>>(path: P) -> Result<ReadResult, String> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
     let mut workbook: Xlsx<_> = open_workbook(path.as_ref())
         .map_err(|e| format!("ファイルを開けません: {}", e))?;
 
@@ -25,119 +25,214 @@ pub fn read_xlsx<P: AsRef<Path>>(path: P) -> Result<ReadResult, String> {
     if sheet_names.is_empty() {
         return Err("ブックにシートがありません".to_string());
     }
-    let primary = sheet_names[0].clone();
 
-    let range = workbook
-        .worksheet_range(&primary)
-        .map_err(|e| format!("シート読み込みエラー: {}", e))?;
-    let formulas = workbook.worksheet_formula(&primary).ok();
+    // Best-effort: hand-parse styles for bg/font color + alignment. We
+    // tolerate a failure (corrupted/encrypted xlsx) by treating it as
+    // "no styles" rather than failing the entire read.
+    let styles = crate::xlsx_styles::read_workbook_styles(&path_str).ok();
 
-    let mut sheet = Sheet::new();
-    sheet.name = primary.clone();
-
-    for (row_idx, row) in range.rows().enumerate() {
-        for (col_idx, cell) in row.iter().enumerate() {
-            // Excel-cached value as a CellValue (used as fallback for
-            // unsupported formulas, and as the literal value for non-formula
-            // cells).
-            let cached = data_to_cellvalue(cell);
-            // Check whether this cell has a formula at the same position.
-            let formula_text = formulas
-                .as_ref()
-                .and_then(|fr| fr.get_value((row_idx as u32, col_idx as u32)).cloned())
-                .filter(|s: &String| !s.is_empty());
-
-            match (formula_text, cached) {
-                (Some(f), cached_val) => {
-                    let input = if f.starts_with('=') { f } else { format!("={}", f) };
-                    sheet.set_cell_with_cache(col_idx, row_idx, input, Some(cached_val));
-                }
-                (None, CellValue::Empty) => { /* skip */ }
-                (None, val) => {
-                    // Plain value: write as literal raw_input so editing
-                    // and round-tripping work naturally.
-                    let raw = match &val {
-                        CellValue::Number(n) => format_number_raw(*n),
-                        CellValue::Text(s) => s.clone(),
-                        CellValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
-                        CellValue::Error(e) => e.to_string().to_string(),
-                        CellValue::Empty | CellValue::Formula(_) => continue,
-                    };
-                    sheet.set_cell(col_idx, row_idx, raw);
+    let mut sheets: Vec<Sheet> = Vec::with_capacity(sheet_names.len());
+    for name in &sheet_names {
+        let range = workbook
+            .worksheet_range(name)
+            .map_err(|e| format!("シート読み込みエラー ({}): {}", name, e))?;
+        let formulas = workbook.worksheet_formula(name).ok();
+        let mut sheet = Sheet::new();
+        sheet.name = name.clone();
+        for (row_idx, row) in range.rows().enumerate() {
+            for (col_idx, cell) in row.iter().enumerate() {
+                let cached = data_to_cellvalue(cell);
+                let formula_text = formulas.as_ref()
+                    .and_then(|fr| fr.get_value((row_idx as u32, col_idx as u32)).cloned())
+                    .filter(|s: &String| !s.is_empty());
+                match (formula_text, cached) {
+                    (Some(f), cached_val) => {
+                        let input = if f.starts_with('=') { f } else { format!("={}", f) };
+                        sheet.set_cell_with_cache(col_idx, row_idx, input, Some(cached_val));
+                    }
+                    (None, CellValue::Empty) => {}
+                    (None, val) => {
+                        let raw = match &val {
+                            CellValue::Number(n) => format_number_raw(*n),
+                            CellValue::Text(s) => s.clone(),
+                            CellValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
+                            CellValue::Error(e) => e.to_string().to_string(),
+                            CellValue::Empty | CellValue::Formula(_) => continue,
+                        };
+                        sheet.set_cell(col_idx, row_idx, raw);
+                    }
                 }
             }
         }
+        // Apply per-cell formatting + conditional formats parsed from the
+        // xlsx (best effort).
+        if let Some(styles_wb) = styles.as_ref() {
+            if let Some(idx) = styles_wb.sheet_names.iter().position(|n| n == name) {
+                if let Some(cell_styles) = styles_wb.sheet_styles.get(idx) {
+                    for ((c, r), st) in cell_styles {
+                        let cell = sheet.cell_format_mut(*c, *r);
+                        if st.font_color.is_some() { cell.text_color = st.font_color; }
+                        if st.bg_color.is_some() { cell.bg_color = st.bg_color; }
+                        if !matches!(st.alignment, crate::cell::Alignment::Default) {
+                            cell.alignment = st.alignment;
+                        }
+                        if st.bold { cell.bold = true; }
+                    }
+                }
+                if let Some(cfs) = styles_wb.sheet_conditionals.get(idx) {
+                    sheet.conditional_formats.extend(cfs.iter().cloned());
+                }
+            }
+        }
+        sheets.push(sheet);
     }
 
-    // Column widths: calamine exposes them via internal API on Xlsx; not
-    // currently part of the public Reader trait, so we skip importing widths
-    // for now. tbla's autowidth can be triggered manually by the user.
-
-    let warning = if sheet_names.len() > 1 {
-        Some(format!(
-            "{} 枚のシートのうち最初の {:?} のみ読み込みました（他: {:?}）",
-            sheet_names.len(),
-            primary,
-            &sheet_names[1..]
-        ))
-    } else {
-        None
-    };
-
-    Ok(ReadResult { sheet, warning })
+    Ok(ReadResult { sheets, warning: None })
 }
 
-/// Write the current `Sheet` to an .xlsx file. Formulas are written as
-/// Excel formulas (so the file recomputes when opened) and tbla's last
-/// evaluated value is written as the cached result. Column widths are
-/// preserved.
+/// Write a single `Sheet` to an .xlsx file. Convenience wrapper around
+/// `write_xlsx_sheets` for the single-sheet case (used by tests).
+#[allow(dead_code)]
 pub fn write_xlsx<P: AsRef<Path>>(sheet: &Sheet, path: P) -> Result<(), String> {
+    write_xlsx_sheets(std::slice::from_ref(sheet), path)
+}
+
+/// Write every sheet in `sheets` to an .xlsx file in the given order.
+/// Formulas are written as Excel formulas (so the file recomputes when
+/// opened) and tbla's last evaluated value is written as the cached result.
+/// Column widths are preserved.
+pub fn write_xlsx_sheets<P: AsRef<Path>>(sheets: &[Sheet], path: P) -> Result<(), String> {
     let mut workbook = Workbook::new();
-    let ws = workbook.add_worksheet();
-    ws.set_name(&sheet.name)
-        .map_err(|e| format!("シート名設定エラー: {}", e))?;
-
-    let max_row = sheet.max_row().unwrap_or(0);
-    let max_col = sheet.max_col().unwrap_or(0);
-
-    for row in 0..=max_row {
-        for col in 0..=max_col {
-            let cell = sheet.get_cell(col, row);
-            if cell.raw_input.is_empty() && matches!(cell.value, CellValue::Empty) {
-                continue;
-            }
-            let r = row as u32;
-            let c = col as u16;
-            let result = match &cell.value {
-                CellValue::Formula(_) => {
-                    // Compute current display value as the cached result so
-                    // viewers that don't recompute (rare) still see something.
-                    let raw_input = cell.raw_input.trim_start_matches('=');
-                    let display = sheet.evaluate(col, row);
-                    let formula = Formula::new(raw_input)
-                        .set_result(&display);
-                    ws.write_formula(r, c, formula).map(|_| ())
+    for sheet in sheets {
+        let ws = workbook.add_worksheet();
+        ws.set_name(&sheet.name)
+            .map_err(|e| format!("シート名設定エラー ({}): {}", sheet.name, e))?;
+        let max_row = sheet.max_row().unwrap_or(0);
+        let max_col = sheet.max_col().unwrap_or(0);
+        for row in 0..=max_row {
+            for col in 0..=max_col {
+                let cell = sheet.get_cell(col, row);
+                if cell.raw_input.is_empty() && matches!(cell.value, CellValue::Empty) {
+                    continue;
                 }
-                CellValue::Number(n) => ws.write_number(r, c, *n).map(|_| ()),
-                CellValue::Boolean(b) => ws.write_boolean(r, c, *b).map(|_| ()),
-                CellValue::Text(s) => ws.write_string(r, c, s).map(|_| ()),
-                CellValue::Error(e) => ws.write_string(r, c, e.to_string()).map(|_| ()),
-                CellValue::Empty => Ok(()),
-            };
-            result.map_err(|e| format!("セル ({},{}) 書き込みエラー: {}", col, row, e))?;
+                let r = row as u32;
+                let c = col as u16;
+                let format = build_format(&cell);
+                let result = match (&cell.value, format.as_ref()) {
+                    (CellValue::Formula(_), fmt) => {
+                        let raw_input = cell.raw_input.trim_start_matches('=');
+                        let display = sheet.evaluate(col, row);
+                        let formula = Formula::new(raw_input).set_result(&display);
+                        match fmt {
+                            Some(f) => ws.write_formula_with_format(r, c, formula, f).map(|_| ()),
+                            None => ws.write_formula(r, c, formula).map(|_| ()),
+                        }
+                    }
+                    (CellValue::Number(n), fmt) => match fmt {
+                        Some(f) => ws.write_number_with_format(r, c, *n, f).map(|_| ()),
+                        None => ws.write_number(r, c, *n).map(|_| ()),
+                    },
+                    (CellValue::Boolean(b), fmt) => match fmt {
+                        Some(f) => ws.write_boolean_with_format(r, c, *b, f).map(|_| ()),
+                        None => ws.write_boolean(r, c, *b).map(|_| ()),
+                    },
+                    (CellValue::Text(s), fmt) => match fmt {
+                        Some(f) => ws.write_string_with_format(r, c, s, f).map(|_| ()),
+                        None => ws.write_string(r, c, s).map(|_| ()),
+                    },
+                    (CellValue::Error(e), fmt) => match fmt {
+                        Some(f) => ws.write_string_with_format(r, c, e.to_string(), f).map(|_| ()),
+                        None => ws.write_string(r, c, e.to_string()).map(|_| ()),
+                    },
+                    (CellValue::Empty, Some(f)) => ws.write_blank(r, c, f).map(|_| ()),
+                    (CellValue::Empty, None) => Ok(()),
+                };
+                result.map_err(|e| format!("セル {} ({},{}) 書き込みエラー: {}", sheet.name, col, row, e))?;
+            }
+        }
+        for col in 0..=max_col {
+            let w = sheet.get_col_width(col) as f64;
+            ws.set_column_width(col as u16, w)
+                .map_err(|e| format!("列幅設定エラー ({}): {}", sheet.name, e))?;
+        }
+        // Conditional-formatting rules: translate each rule to the Excel
+        // equivalent. Unsupported variants are best-effort.
+        for rule in &sheet.conditional_formats {
+            apply_conditional(ws, rule).map_err(|e| format!("条件付き書式エラー ({}): {}", sheet.name, e))?;
         }
     }
-
-    // Column widths: rust_xlsxwriter takes width in character units.
-    // tbla's units match Excel's "character widths" closely enough.
-    for col in 0..=max_col {
-        let w = sheet.get_col_width(col) as f64;
-        ws.set_column_width(col as u16, w)
-            .map_err(|e| format!("列幅設定エラー: {}", e))?;
-    }
-
     workbook.save(path.as_ref())
         .map_err(|e| format!("保存エラー: {}", e))?;
+    Ok(())
+}
+
+fn rgb_to_xcolor(rgb: RgbColor) -> XColor {
+    XColor::RGB(((rgb.0 as u32) << 16) | ((rgb.1 as u32) << 8) | (rgb.2 as u32))
+}
+
+fn build_format(cell: &Cell) -> Option<Format> {
+    if !cell.has_format() && cell.text_color.is_none() && cell.bg_color.is_none() {
+        return None;
+    }
+    let mut f = Format::new();
+    if cell.bold { f = f.set_bold(); }
+    if let Some(tc) = cell.text_color { f = f.set_font_color(rgb_to_xcolor(tc)); }
+    if let Some(bc) = cell.bg_color { f = f.set_background_color(rgb_to_xcolor(bc)); }
+    match cell.alignment {
+        Alignment::Left => f = f.set_align(FormatAlign::Left),
+        Alignment::Center => f = f.set_align(FormatAlign::Center),
+        Alignment::Right => f = f.set_align(FormatAlign::Right),
+        Alignment::Default => {}
+    }
+    // Number format
+    f = match &cell.format {
+        DisplayFormat::General => f,
+        DisplayFormat::Number(d) => f.set_num_format(format!("0.{}", "0".repeat(*d))),
+        DisplayFormat::Currency(d) => f.set_num_format(format!("¥#,##0.{}", "0".repeat(*d))),
+        DisplayFormat::Percent(d) => f.set_num_format(format!("0.{}%", "0".repeat(*d))),
+        DisplayFormat::Scientific => f.set_num_format("0.00E+00"),
+        DisplayFormat::Date => f.set_num_format("yyyy-mm-dd"),
+        DisplayFormat::Text => f.set_num_format("@"),
+    };
+    Some(f)
+}
+
+fn apply_conditional(ws: &mut rust_xlsxwriter::Worksheet, rule: &CondFmt) -> Result<(), String> {
+    let first_row = rule.min_row as u32;
+    let first_col = rule.min_col as u16;
+    let last_row = rule.max_row as u32;
+    let last_col = rule.max_col as u16;
+    match &rule.condition {
+        CondCondition::Compare { op, target } => {
+            let cell_rule = match op {
+                CondOp::Gt => ConditionalFormatCellRule::GreaterThan(*target),
+                CondOp::Lt => ConditionalFormatCellRule::LessThan(*target),
+                CondOp::Ge => ConditionalFormatCellRule::GreaterThanOrEqualTo(*target),
+                CondOp::Le => ConditionalFormatCellRule::LessThanOrEqualTo(*target),
+                CondOp::Eq => ConditionalFormatCellRule::EqualTo(*target),
+                CondOp::Ne => ConditionalFormatCellRule::NotEqualTo(*target),
+            };
+            let mut fmt = Format::new();
+            if let Some(bg) = rule.bg_color { fmt = fmt.set_background_color(rgb_to_xcolor(bg)); }
+            if let Some(fg) = rule.text_color { fmt = fmt.set_font_color(rgb_to_xcolor(fg)); }
+            let cf = ConditionalFormatCell::new().set_rule(cell_rule).set_format(fmt);
+            ws.add_conditional_format(first_row, first_col, last_row, last_col, &cf)
+                .map_err(|e| e.to_string())?;
+        }
+        CondCondition::ColorScale { min_color, max_color, .. } => {
+            let cf = ConditionalFormat2ColorScale::new()
+                .set_minimum_color(rgb_to_xcolor(*min_color))
+                .set_maximum_color(rgb_to_xcolor(*max_color));
+            ws.add_conditional_format(first_row, first_col, last_row, last_col, &cf)
+                .map_err(|e| e.to_string())?;
+        }
+        CondCondition::DataBar { bar_color, .. } => {
+            let cf = ConditionalFormatDataBar::new()
+                .set_fill_color(rgb_to_xcolor(*bar_color));
+            ws.add_conditional_format(first_row, first_col, last_row, last_col, &cf)
+                .map_err(|e| e.to_string())?;
+        }
+    }
     Ok(())
 }
 
@@ -193,7 +288,8 @@ mod tests {
         write_xlsx(&s, &path).expect("write");
 
         let result = read_xlsx(&path).expect("read");
-        let s2 = result.sheet;
+        assert_eq!(result.sheets.len(), 1);
+        let s2 = &result.sheets[0];
 
         assert_eq!(s2.get_cell(0, 0).raw_input, "ヘッダー");
         assert_eq!(s2.get_cell(0, 1).raw_input, "10");
@@ -224,11 +320,77 @@ mod tests {
         }
 
         let result = read_xlsx(&path).expect("read");
-        let s = result.sheet;
+        let s = &result.sheets[0];
         // raw_input preserved as formula
         assert!(s.get_cell(0, 1).raw_input.starts_with('='));
         // Displayed value falls back to cached "0"
         assert_eq!(s.evaluate(0, 1), "0");
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn read_users_book1_data_bar() {
+        // Sanity-check against the user-provided file with a dataBar rule.
+        // Skip silently if the file isn't present (CI / other users).
+        let path = "/Users/fukuyori/Downloads/Book 1.xlsx";
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skipping: {} not present", path);
+            return;
+        }
+        let r = read_xlsx(path).expect("read Book 1.xlsx");
+        assert_eq!(r.sheets.len(), 1);
+        let s = &r.sheets[0];
+        // Values
+        assert_eq!(s.get_cell(0, 0).raw_input, "-1");
+        assert_eq!(s.get_cell(1, 0).raw_input, "10");
+        // Data bar conditional format
+        assert!(!s.conditional_formats.is_empty(), "expected a conditional format");
+        let cf = &s.conditional_formats[0];
+        assert!(matches!(cf.condition, crate::sheet::CondCondition::DataBar { .. }),
+            "expected DataBar, got {:?}", cf.condition);
+        assert_eq!((cf.min_col, cf.min_row, cf.max_col, cf.max_row), (0, 0, 2, 2));
+    }
+
+    #[test]
+    fn cell_formats_round_trip_through_xlsx() {
+        // Write a sheet with bold + colors + alignment, read it back, and
+        // verify the formatting survives.
+        let mut s = Sheet::new();
+        s.set_cell(0, 0, "Header".to_string());
+        s.set_cell(0, 1, "100".to_string());
+        s.set_cell(1, 1, "200".to_string());
+
+        {
+            let c = s.cell_format_mut(0, 0);
+            c.bold = true;
+            c.alignment = crate::cell::Alignment::Center;
+            c.text_color = Some((10, 10, 200));
+            c.bg_color = Some((255, 240, 200));
+        }
+        {
+            let c = s.cell_format_mut(0, 1);
+            c.alignment = crate::cell::Alignment::Right;
+            c.bg_color = Some((220, 255, 220));
+        }
+
+        let path = tmp_path("formats_round_trip");
+        write_xlsx(&s, &path).expect("write");
+
+        let result = read_xlsx(&path).expect("read");
+        let s2 = &result.sheets[0];
+
+        let c00 = s2.get_cell(0, 0);
+        assert_eq!(c00.raw_input, "Header");
+        assert!(c00.bold, "bold should survive round-trip");
+        assert!(matches!(c00.alignment, crate::cell::Alignment::Center),
+            "center alignment should survive (got {:?})", c00.alignment);
+        assert_eq!(c00.text_color, Some((10, 10, 200)));
+        assert_eq!(c00.bg_color, Some((255, 240, 200)));
+
+        let c01 = s2.get_cell(0, 1);
+        assert!(matches!(c01.alignment, crate::cell::Alignment::Right));
+        assert_eq!(c01.bg_color, Some((220, 255, 220)));
 
         std::fs::remove_file(&path).ok();
     }

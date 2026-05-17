@@ -824,16 +824,18 @@ dependencies = [
 
 [[package]]
 name = "tbla"
-version = "0.2.2"
+version = "0.3.0"
 dependencies = [
  "arboard",
  "calamine",
  "chrono",
  "crossterm",
+ "quick-xml",
  "rust_xlsxwriter",
  "serde",
  "serde_json",
  "unicode-width",
+ "zip 4.6.1",
 ]
 
 [[package]]

@@ -1,7 +1,7 @@
 use crossterm::{
     cursor::{Hide, MoveTo, Show},
     queue,
-    style::{Color, ResetColor, SetBackgroundColor, SetForegroundColor},
+    style::{Attribute, Color, ResetColor, SetAttribute, SetBackgroundColor, SetForegroundColor},
     terminal::{self, Clear, ClearType},
 };
 use std::cell::Cell;
@@ -9,9 +9,13 @@ use std::io::{stdout, BufWriter, Result, Write};
 use unicode_width::UnicodeWidthStr;
 
 use crate::{App, Mode};
-use crate::cell::CellValue;
+use crate::cell::{Alignment, CellValue, RgbColor};
 use crate::formula;
 use crate::menu::{MenuBar, MenuState, SubItem, ContextMenu};
+
+fn rgb_to_color(rgb: RgbColor) -> Color {
+    Color::Rgb { r: rgb.0, g: rgb.1, b: rgb.2 }
+}
 
 const ROW_LABEL_WIDTH: usize = 5;
 
@@ -104,13 +108,19 @@ fn set_cursor_visible<W: Write>(stdout: &mut W, want_visible: bool) -> Result<()
     Ok(())
 }
 
-// Colors
+// Colors. All theme-independent (truecolor RGB) so tbla looks the same
+// across every terminal — `BLACK` / `WHITE` are deliberately
+// avoided because terminals like macOS Terminal.app remap "white" to
+// `#bbbbbb`, making text washed out and selection contrast unreliable.
+const BLACK: Color = Color::Rgb { r: 0, g: 0, b: 0 };
+const WHITE: Color = Color::Rgb { r: 230, g: 230, b: 230 };
+const DARK_GREY: Color = Color::Rgb { r: 120, g: 120, b: 120 };
 const GREEN: Color = Color::Rgb { r: 0, g: 170, b: 0 };
 const ORANGE: Color = Color::Rgb { r: 255, g: 136, b: 0 };
 const MENU_BG: Color = Color::Rgb { r: 220, g: 220, b: 220 };
-const MENU_FG: Color = Color::Black;
+const MENU_FG: Color = BLACK;
 const MENU_SEL_BG: Color = Color::Rgb { r: 0, g: 100, b: 200 };
-const MENU_SEL_FG: Color = Color::White;
+const MENU_SEL_FG: Color = WHITE;
 const SELECTION_BG: Color = Color::Rgb { r: 60, g: 110, b: 200 };
 // Point mode (Excel-style formula reference selection) highlight
 const POINT_CURSOR_BG: Color = Color::Rgb { r: 80, g: 150, b: 255 };
@@ -165,6 +175,17 @@ fn pad_to_width(s: &str, target_width: usize, align_right: bool) -> String {
     } else {
         format!("{}{}", s, " ".repeat(padding))
     }
+}
+
+fn center_to_width(s: &str, target_width: usize) -> String {
+    let current = UnicodeWidthStr::width(s);
+    if current >= target_width {
+        return truncate_to_width(s, target_width);
+    }
+    let total_pad = target_width - current;
+    let left = total_pad / 2;
+    let right = total_pad - left;
+    format!("{}{}{}", " ".repeat(left), s, " ".repeat(right))
 }
 
 fn display_width(s: &str) -> usize {
@@ -341,8 +362,11 @@ impl UI {
         // it conservatively at the top of each frame.
         invalidate_color_cache();
         let (term_width, term_height) = terminal::size()?;
-        // Layout: row 0 = menu bar, row 1 = column headers, grid, then formula bar + status
-        let grid_height = (term_height as usize).saturating_sub(4);
+        // Layout: row 0 = menu bar, row 1 = column headers, grid, [tab bar],
+        // formula bar, status bar. Tab bar is only shown when there are 2+
+        // sheets so single-sheet workbooks lose no vertical space.
+        let tab_height: usize = if app.sheet_count() > 1 { 1 } else { 0 };
+        let grid_height = (term_height as usize).saturating_sub(4 + tab_height);
         let visible_cols = Self::calc_visible_cols(app, term_width as usize);
 
         let cursor_color = Self::cursor_color(app.mode);
@@ -359,6 +383,9 @@ impl UI {
         Self::draw_menu_bar(&mut stdout, app, term_width)?;
         Self::draw_column_headers(&mut stdout, app, &visible_cols, term_width)?;
         Self::draw_grid(&mut stdout, app, grid_height, &visible_cols, term_width, cursor_color)?;
+        if tab_height > 0 {
+            Self::draw_sheet_tabs(&mut stdout, app, term_height, term_width)?;
+        }
         Self::draw_formula_bar(&mut stdout, app, term_height, term_width)?;
         Self::draw_status_bar(&mut stdout, app, term_height, term_width)?;
 
@@ -384,11 +411,16 @@ impl UI {
                 set_cursor_visible(&mut stdout, false)?;
             }
         } else if app.mode == Mode::Dialog {
-            // Place the cursor at the end of the dialog input
+            // Place the cursor at the end of the focused dialog input.
             if let Some(dialog) = &app.dialog {
-                let prefix = format!(" {}: ", dialog.label);
-                let x = display_width(&prefix) + display_width(&dialog.input);
-                queue!(stdout, MoveTo(x as u16, term_height - 2))?;
+                let n = dialog.fields.len();
+                let f = &dialog.fields[dialog.focus];
+                // Field i (0-based) renders at term_height - (n + 1 - i) so
+                // field 0 is on top and the bottom (hint) line stays at -1.
+                let line_from_bottom = (n + 1 - dialog.focus) as u16;
+                let prefix = format!(" {}: ", f.label);
+                let x = display_width(&prefix) + display_width(&f.input);
+                queue!(stdout, MoveTo(x as u16, term_height - line_from_bottom))?;
                 set_cursor_visible(&mut stdout, true)?;
             } else {
                 set_cursor_visible(&mut stdout, false)?;
@@ -509,23 +541,35 @@ impl UI {
     fn draw_dialog(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
         let Some(dialog) = &app.dialog else { return Ok(()); };
 
-        // Render as bottom prompt (overlays the formula bar area)
-        queue!(
-            stdout,
-            MoveTo(0, term_height - 2),
-            SetBackgroundColor(MENU_BG),
-            SetForegroundColor(MENU_FG)
-        )?;
-        let prompt = format!(" {}: {}_ ", dialog.label, dialog.input);
-        let display = pad_to_width(&prompt, term_width as usize, false);
-        write!(stdout, "{}", display)?;
-        queue!(stdout, ResetColor)?;
+        // Each field gets its own row above the hint line. Field 0 sits at
+        // the top of the dialog area, last field just above the hint.
+        let n = dialog.fields.len();
+        let multi = n > 1;
+        for (i, f) in dialog.fields.iter().enumerate() {
+            let line_from_bottom = (n + 1 - i) as u16;
+            queue!(
+                stdout,
+                MoveTo(0, term_height - line_from_bottom),
+                SetBackgroundColor(MENU_BG),
+                SetForegroundColor(MENU_FG)
+            )?;
+            let cursor = if i == dialog.focus { "_" } else { " " };
+            let trailing = if multi && i == n - 1 {
+                "  (Tab で切替, Enter で実行)"
+            } else {
+                ""
+            };
+            let prompt = format!(" {}: {}{}{} ", f.label, f.input, cursor, trailing);
+            let display = pad_to_width(&prompt, term_width as usize, false);
+            write!(stdout, "{}", display)?;
+            queue!(stdout, ResetColor)?;
+        }
 
         // Hint line
         queue!(
             stdout,
             MoveTo(0, term_height - 1),
-            SetBackgroundColor(Color::Black),
+            SetBackgroundColor(BLACK),
             SetForegroundColor(GREEN)
         )?;
         let hint = " Enter: 実行   Esc: キャンセル ".to_string();
@@ -540,7 +584,7 @@ impl UI {
             stdout,
             MoveTo(0, 1),
             SetBackgroundColor(GREEN),
-            SetForegroundColor(Color::Black),
+            SetForegroundColor(BLACK),
         )?;
 
         write!(stdout, "{:width$}", "", width = ROW_LABEL_WIDTH)?;
@@ -584,20 +628,26 @@ impl UI {
             })
         });
 
-        for row in 0..grid_height {
-            let actual_row = app.view_row + row;
-            let screen_row = (row + 2) as u16;
+        // Build the list of visible logical rows starting at view_row,
+        // skipping rows hidden by an active filter, up to grid_height rows.
+        let visible_rows: Vec<usize> = (app.view_row..usize::MAX)
+            .filter(|r| !app.hidden_rows.contains(r))
+            .take(grid_height)
+            .collect();
+
+        for (row_idx, &actual_row) in visible_rows.iter().enumerate() {
+            let screen_row = (row_idx + 2) as u16;
 
             // Start with a fully-cleared line in the default cell background
             // so any residual content (e.g. left over from IME composition or
             // a previous wider render) is wiped.
             queue!(stdout, MoveTo(0, screen_row))?;
-            set_bg(stdout, Color::Black)?;
+            set_bg(stdout, BLACK)?;
             queue!(stdout, Clear(ClearType::CurrentLine))?;
 
             // Row label
             queue!(stdout, MoveTo(0, screen_row))?;
-            set_colors(stdout, Color::Black, GREEN)?;
+            set_colors(stdout, BLACK, GREEN)?;
             write!(stdout, "{:>width$}", actual_row + 1, width = ROW_LABEL_WIDTH)?;
 
             let mut used = ROW_LABEL_WIDTH;
@@ -632,7 +682,7 @@ impl UI {
                     let w = display_width(&input) + extra;
                     (input, w)
                 } else {
-                    let v = app.sheet.evaluate(actual_col, actual_row);
+                    let v = app.evaluate(actual_col, actual_row);
                     let w = display_width(&v);
                     (v, w)
                 };
@@ -689,16 +739,32 @@ impl UI {
                     })
                     .unwrap_or(false);
 
+                // Look up any cell-level format overrides, conditional
+                // formatting, and decide the base colors. Selection / cursor
+                // / point-mode highlights take precedence over user-set
+                // formatting so the selected cell always reads as selected.
+                let manual_bg = cell.bg_color.map(rgb_to_color);
+                let manual_fg = cell.text_color.map(rgb_to_color);
+                let cond = {
+                    let v = app.sheet.evaluate(actual_col, actual_row);
+                    app.sheet.lookup_conditional(actual_col, actual_row, &v)
+                };
+                let cond_bg = cond.bg_color.map(rgb_to_color);
+                let cond_fg = cond.text_color.map(rgb_to_color);
+                let user_bg = manual_bg.or(cond_bg);
+                let user_fg = manual_fg.or(cond_fg);
+                let data_bar = cond.data_bar; // (fraction, rgb)
+
                 let (bg, fg) = if is_cursor {
-                    (cursor_color, Color::Black)
+                    (cursor_color, BLACK)
                 } else if is_point_cursor {
-                    (POINT_CURSOR_BG, Color::Black)
+                    (POINT_CURSOR_BG, BLACK)
                 } else if is_in_point_range {
-                    (POINT_RANGE_BG, Color::White)
+                    (POINT_RANGE_BG, WHITE)
                 } else if is_selected {
-                    (SELECTION_BG, Color::White)
+                    (SELECTION_BG, WHITE)
                 } else {
-                    (Color::Black, GREEN)
+                    (user_bg.unwrap_or(BLACK), user_fg.unwrap_or(WHITE))
                 };
 
                 if is_editing {
@@ -733,13 +799,45 @@ impl UI {
                     };
 
                     set_colors(stdout, fg, bg)?;
+                    if cell.bold {
+                        queue!(stdout, SetAttribute(Attribute::Bold))?;
+                    }
 
-                    let formatted = if is_number {
-                        pad_to_width(&content, content_width, true)
-                    } else {
-                        pad_to_width(&content, content_width, false)
+                    // Cell-level alignment overrides the auto right/left
+                    // default; explicit Default falls back to the auto rule.
+                    let right_align = match cell.alignment {
+                        Alignment::Left => false,
+                        Alignment::Right => true,
+                        Alignment::Center => false, // handled below
+                        Alignment::Default => is_number,
                     };
-                    write!(stdout, "{} ", formatted)?;
+                    let formatted = if matches!(cell.alignment, Alignment::Center) {
+                        center_to_width(&content, content_width)
+                    } else {
+                        pad_to_width(&content, content_width, right_align)
+                    };
+                    if let Some((frac, bar_rgb)) = data_bar {
+                        // Data-bar overlay: render the first `filled` cells
+                        // with bar color background, the rest with normal bg.
+                        let bar_color = rgb_to_color(bar_rgb);
+                        let filled = (content_width as f64 * frac).round() as usize;
+                        let chars: Vec<char> = formatted.chars().collect();
+                        for (i, ch) in chars.iter().enumerate() {
+                            let target_bg = if i < filled { bar_color } else { bg };
+                            set_colors(stdout, fg, target_bg)?;
+                            write!(stdout, "{}", ch)?;
+                        }
+                        set_colors(stdout, fg, bg)?;
+                        write!(stdout, " ")?;
+                    } else {
+                        write!(stdout, "{} ", formatted)?;
+                    }
+                    if cell.bold {
+                        queue!(stdout, SetAttribute(Attribute::Reset))?;
+                        // Reset attribute also clears colors on some terms;
+                        // re-apply so the trailing space stays correct.
+                        set_colors(stdout, fg, bg)?;
+                    }
                 }
 
                 // Note: no ResetColor here — next cell will set its own colors
@@ -751,11 +849,61 @@ impl UI {
 
             let remaining = (term_width as usize).saturating_sub(used);
             if remaining > 0 {
-                set_bg(stdout, Color::Black)?;
+                set_bg(stdout, BLACK)?;
                 write!(stdout, "{:width$}", "", width = remaining)?;
             }
         }
+        // If filter or end-of-sheet means visible_rows has fewer entries than
+        // grid_height, blank out the trailing rows so stale content from
+        // previous frames doesn't linger.
+        for tail in visible_rows.len()..grid_height {
+            let screen_row = (tail + 2) as u16;
+            queue!(stdout, MoveTo(0, screen_row))?;
+            set_bg(stdout, BLACK)?;
+            queue!(stdout, Clear(ClearType::CurrentLine))?;
+        }
         reset_colors(stdout)?;
+        Ok(())
+    }
+
+    fn draw_sheet_tabs(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
+        // Drawn at term_height - 3 (just above formula bar). One line tall.
+        queue!(
+            stdout,
+            MoveTo(0, term_height - 3),
+            SetBackgroundColor(BLACK),
+            SetForegroundColor(WHITE),
+        )?;
+        // Sheets are rendered as " name " segments separated by | with the
+        // active tab inverted.
+        let mut used = 0usize;
+        for (idx, sheet) in app.workbook_sheets().iter().enumerate() {
+            let label = format!(" {} ", sheet.name);
+            let w = display_width(&label);
+            if used + w + 1 > term_width as usize {
+                // Truncation marker for overflow.
+                queue!(stdout, SetBackgroundColor(BLACK), SetForegroundColor(DARK_GREY))?;
+                write!(stdout, " …")?;
+                used += 2;
+                break;
+            }
+            if idx == app.active_sheet_index {
+                queue!(stdout, SetBackgroundColor(WHITE), SetForegroundColor(BLACK))?;
+            } else {
+                queue!(stdout, SetBackgroundColor(DARK_GREY), SetForegroundColor(WHITE))?;
+            }
+            write!(stdout, "{}", label)?;
+            queue!(stdout, SetBackgroundColor(BLACK))?;
+            write!(stdout, " ")?;
+            used += w + 1;
+        }
+        // Fill remaining width with black.
+        let remaining = (term_width as usize).saturating_sub(used);
+        if remaining > 0 {
+            queue!(stdout, SetBackgroundColor(BLACK))?;
+            write!(stdout, "{:width$}", "", width = remaining)?;
+        }
+        queue!(stdout, ResetColor)?;
         Ok(())
     }
 
@@ -764,7 +912,7 @@ impl UI {
             stdout,
             MoveTo(0, term_height - 2),
             SetBackgroundColor(GREEN),
-            SetForegroundColor(Color::Black),
+            SetForegroundColor(BLACK),
         )?;
 
         let cell_name = formula::cell_name(app.cursor_col, app.cursor_row);
@@ -782,7 +930,7 @@ impl UI {
                 let cell = app.sheet.get_cell(app.cursor_col, app.cursor_row);
                 let suffix = match &cell.value {
                     CellValue::Formula(_) => {
-                        let evaluated = app.sheet.evaluate(app.cursor_col, app.cursor_row);
+                        let evaluated = app.evaluate(app.cursor_col, app.cursor_row);
                         format!("{} → {}", cell.raw_input, evaluated)
                     }
                     _ => cell.raw_input.clone(),
@@ -810,7 +958,7 @@ impl UI {
         queue!(
             stdout,
             MoveTo(0, term_height - 1),
-            SetBackgroundColor(Color::Black),
+            SetBackgroundColor(BLACK),
             SetForegroundColor(GREEN),
         )?;
 
