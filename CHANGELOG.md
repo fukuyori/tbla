@@ -4,6 +4,68 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.1] - 2026-05-17
+
+### Added — Polars DataFrame view (analytical layer)
+A new DataFrame view backed by Polars makes tbla viable for million-row
+analytical work without giving up the spreadsheet UI. The view is opt-in
+per sheet and round-trips losslessly to/from the existing cell model.
+
+**Conversion + read-only display**
+- `データ → DataFrame ビューに変換` builds a typed `DataFrame` from the
+  current sheet (row 0 = headers; columns auto-inferred to Int64 /
+  Float64 / Boolean / Utf8; empty cells become nulls).
+- `データ → セルビューに戻す` reverts; the underlying cells were
+  preserved while in DataFrame mode so this is lossless.
+- Status bar shows `DF N×M [Int64, Utf8, …]` so the row count and
+  column types are visible at a glance.
+- Header row renders bold and centered.
+
+**Editing in DataFrame view**
+- Row 0 edits rename the column. Empty / duplicate names are rejected.
+- Data-row edits update the underlying Series. If the new string parses
+  into the column's dtype, it's stored as that type; otherwise the
+  column is **widened to Utf8 once** and the value is stored verbatim.
+  Empty input becomes null.
+- Undo (Ctrl+Z) covers DataFrame edits — each edit records a snapshot.
+
+**Computed columns**
+- `データ → 計算列を追加…` adds a derived column from a Polars-SQL
+  expression: e.g. `revenue = price * qty`, `tax = revenue * 0.1`,
+  `grade = CASE WHEN score >= 80 THEN 'A' ELSE 'B' END`. Earlier
+  computed columns can be referenced by later ones.
+- `データ → 計算列をクリア` resets to the freshly-converted DataFrame.
+
+**Analytical operations**
+- `データ → SQL クエリ…` runs an arbitrary Polars SQL query against the
+  active DataFrame (referenced as table `df`):
+  - `SELECT * FROM df WHERE price > 100`
+  - `SELECT category, SUM(amount) FROM df GROUP BY category ORDER BY 2 DESC`
+  - `SELECT * EXCLUDE name FROM df`
+- `データ → グループ集計…` builds the GROUP BY SQL behind the scenes:
+  fields are group columns (comma separated) and `col:func` aggregations
+  (`sum / avg / min / max / count / stddev / var`).
+
+**Direct CSV / Parquet I/O**
+- `.parquet` files are first-class: opening a `.parquet` via `File →
+  Open` (or as a CLI arg) loads directly into a DataFrame view. Saving
+  to `.parquet` uses Snappy compression — typical numeric data is ~10×
+  smaller than CSV.
+- `ファイル → CSV を DataFrame として開く…` uses Polars's fast,
+  chunked, columnar CSV reader with auto type inference, suitable for
+  10 MB / millions-of-rows files the cell importer would choke on.
+- `ファイル → Parquet として保存…` writes the active sheet as Parquet
+  (auto-converts cells → DataFrame on the fly when needed).
+
+### New dependencies
+- `polars = "0.47"` with features `lazy, csv, strings, dtype-full, fmt,
+  sql, parquet, streaming`. Adds ~30 MB to the release binary and a
+  one-time ~2-minute first build; subsequent builds are incremental.
+
+### Notes
+- Row insertion / deletion / column add-drop are not yet UI-exposed in
+  DataFrame view. Use SQL queries for those structural changes.
+
 ## [0.3.0] - 2026-05-17
 
 ### Added — Cell formatting

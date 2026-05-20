@@ -5,7 +5,7 @@ A terminal spreadsheet editor with standard keyboard and mouse operation.
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Latest Release](https://img.shields.io/github/v/release/fukuyori/tbla)](https://github.com/fukuyori/tbla/releases/latest)
 
-[日本語](README_ja.md)
+[日本語](README_ja.md) ｜ [📖 詳細ガイド (日本語)](GUIDE_ja.md)
 
 ![tbla screenshot](images/screenshot.png)
 
@@ -323,6 +323,56 @@ absolute-row references can break.
 
 `Data → Clear filter` shows all rows again. **Filter state is session-only**
 — it's automatically cleared when you save the file.
+
+### DataFrame view (experimental)
+
+`Data → Convert to DataFrame view` reinterprets the sheet as a typed
+Polars `DataFrame`, suited to large analytical data.
+
+| Action | Effect |
+|--------|--------|
+| Data → Convert to DataFrame view | Row 0 = headers, columns auto-typed (Int64 / Float64 / Boolean / Utf8) |
+| Data → Back to cell view | Restore the cell view (cells are preserved underneath, so this is lossless) |
+
+- **Editable**: row 0 edits rename the column; data-row edits update the
+  typed value (with auto-widening to Utf8 if the new text doesn't parse).
+- Status bar reports row/col counts and the column-type digest, e.g.
+  `DF 1000×8 [Int64, Utf8, Float64, …]`.
+- Header row is rendered bold and centered.
+
+**Computed columns**: `Data → Add computed column…` lets you add a
+derived column. Examples:
+
+| Column | Expression |
+|--------|-----------|
+| `revenue` | `price * qty` |
+| `tax` | `revenue * 0.1` (can reference earlier computed columns) |
+| `grade` | `CASE WHEN score >= 80 THEN 'A' ELSE 'B' END` |
+
+Expressions are evaluated by Polars's SQL engine, so `CASE WHEN`,
+arithmetic, and built-in functions (`ROUND`, `COALESCE`, …) are all
+available. `Data → Clear computed columns` resets the view.
+
+**Direct I/O**:
+- **`.parquet`** files open as a DataFrame view via `File → Open` (or
+  CLI arg) and save via `File → Save As`. Compressed with Snappy —
+  typical numeric data is ~10× smaller than CSV.
+- **`File → Open CSV as DataFrame…`** uses Polars' fast columnar CSV
+  reader for large files (10 MB / millions of rows) that would choke
+  the cell-based import path.
+
+**Analytical operations** (DataFrame view only):
+
+| Menu | What it does | Example |
+|------|-------------|---------|
+| Data → SQL query… | Run any Polars SQL against the `df` table | `SELECT * FROM df WHERE price > 100` |
+| Data → Group aggregate… | Builds GROUP BY SQL behind the scenes | Group: `category` / Agg: `amount:sum, score:avg` |
+
+Supported aggregations: `sum / avg / min / max / count / stddev / var`.
+The SQL result replaces the current DataFrame; Ctrl+Z restores the
+previous view.
+
+Planned next: pivot, join across DataFrames.
 
 ### Multi-sheet workbook
 

@@ -669,18 +669,42 @@ impl UI {
                 let is_editing = is_cursor && app.mode == Mode::Edit;
 
                 let cell = app.sheet.get_cell(actual_col, actual_row);
-                let is_number = matches!(cell.value, CellValue::Number(_) | CellValue::Formula(_));
+                // When the sheet is in DataFrame view, override the value /
+                // number-ness so the grid reads from the DataFrame. Row 0
+                // shows column headers (rendered bold for visual cue).
+                let is_df_view = app.sheet.df_view.is_some();
+                let is_df_header_row = is_df_view && actual_row == 0;
+                let (df_value, df_is_number) = if let Some(view) = app.sheet.df_view.as_ref() {
+                    if actual_row == 0 {
+                        (Some(view.header(actual_col)), false)
+                    } else if actual_row - 1 < view.rows() && actual_col < view.cols() {
+                        (Some(view.value_at(actual_col, actual_row - 1)), view.is_numeric(actual_col))
+                    } else {
+                        (Some(String::new()), false)
+                    }
+                } else {
+                    (None, false)
+                };
+
+                let is_number = if is_df_view {
+                    df_is_number
+                } else {
+                    matches!(cell.value, CellValue::Number(_) | CellValue::Formula(_))
+                };
 
                 // Compute the value to display and the width it would need.
                 // For editing, account for at least one extra column for the
                 // block cursor when the text cursor is at the end of input.
-                let (value, value_display_width) = if is_editing {
+                let (value, value_display_width) = if is_editing && !is_df_view {
                     let input = app.input_buffer.clone();
                     let cursor_at_end =
                         app.edit_cursor_pos >= input.chars().count();
                     let extra = if cursor_at_end { 1 } else { 0 };
                     let w = display_width(&input) + extra;
                     (input, w)
+                } else if let Some(v) = df_value {
+                    let w = display_width(&v);
+                    (v, w)
                 } else {
                     let v = app.evaluate(actual_col, actual_row);
                     let w = display_width(&v);
@@ -799,19 +823,26 @@ impl UI {
                     };
 
                     set_colors(stdout, fg, bg)?;
-                    if cell.bold {
+                    let bold_active = cell.bold || is_df_header_row;
+                    if bold_active {
                         queue!(stdout, SetAttribute(Attribute::Bold))?;
                     }
 
                     // Cell-level alignment overrides the auto right/left
                     // default; explicit Default falls back to the auto rule.
-                    let right_align = match cell.alignment {
+                    // DataFrame headers center for visual cue.
+                    let alignment_effective = if is_df_header_row {
+                        Alignment::Center
+                    } else {
+                        cell.alignment
+                    };
+                    let right_align = match alignment_effective {
                         Alignment::Left => false,
                         Alignment::Right => true,
                         Alignment::Center => false, // handled below
                         Alignment::Default => is_number,
                     };
-                    let formatted = if matches!(cell.alignment, Alignment::Center) {
+                    let formatted = if matches!(alignment_effective, Alignment::Center) {
                         center_to_width(&content, content_width)
                     } else {
                         pad_to_width(&content, content_width, right_align)
@@ -832,7 +863,7 @@ impl UI {
                     } else {
                         write!(stdout, "{} ", formatted)?;
                     }
-                    if cell.bold {
+                    if bold_active {
                         queue!(stdout, SetAttribute(Attribute::Reset))?;
                         // Reset attribute also clears colors on some terms;
                         // re-apply so the trailing space stays correct.
@@ -982,7 +1013,13 @@ impl UI {
         } else {
             String::new()
         };
-        let right = format!(" {} | {} | F10:メニュー ", mode_str, file_str);
+        // DataFrame view indicator: shows row/col count and dtype digest.
+        let df_str = if let Some(v) = app.sheet.df_view.as_ref() {
+            format!(" DF {}×{} [{}] |", v.rows(), v.cols(), v.dtype_summary(4))
+        } else {
+            String::new()
+        };
+        let right = format!("{} {} | {} | F10:メニュー ", df_str, mode_str, file_str);
 
         let term_w = term_width as usize;
         // Right side gets priority — clip it first if even it is too wide.

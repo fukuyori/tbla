@@ -79,6 +79,12 @@ pub struct Sheet {
     col_widths: HashMap<usize, usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_formats: Vec<ConditionalFormat>,
+    /// Session-only Polars DataFrame view. When `Some`, the grid renders
+    /// from the DataFrame and ignores `cells` for display. Cells remain
+    /// untouched underneath so reverting to cell view is lossless.
+    /// Not serialized: file save / load round-trips through `cells`.
+    #[serde(skip)]
+    pub df_view: Option<crate::df_view::DataFrameView>,
 }
 
 impl Sheet {
@@ -88,8 +94,12 @@ impl Sheet {
             cells: HashMap::new(),
             col_widths: HashMap::new(),
             conditional_formats: Vec::new(),
+            df_view: None,
         }
     }
+
+    /// True when a DataFrame view is currently active for this sheet.
+    pub fn is_df_view(&self) -> bool { self.df_view.is_some() }
 
     /// Output of resolving conditional formatting at one cell. `text_color`
     /// and `bg_color` are uniform-fill colors; `data_bar` is `(fill_fraction,

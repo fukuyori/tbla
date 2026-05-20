@@ -534,6 +534,19 @@ fn save_file(app: &App, filename: &str) -> Result<String, String> {
             crate::xlsx::write_xlsx_sheets(&sheets, &filename)?;
             Ok(filename)
         }
+        "parquet" => {
+            // Parquet write requires a DataFrame view on the active sheet.
+            // If the user is in cell view, convert on the fly (without
+            // mutating the in-memory view).
+            let view = if let Some(v) = app.sheet.df_view.clone() {
+                v
+            } else {
+                crate::df_view::cells_to_dataframe(&app.sheet)
+                    .map_err(|e| format!("Parquet 保存には DataFrame ビューが必要です: {}", e))?
+            };
+            crate::df_io::write_parquet(&view, &filename)?;
+            Ok(filename)
+        }
         _ => {
             save_json(app, &filename).map_err(|e| e.to_string())?;
             Ok(filename)
@@ -566,6 +579,22 @@ fn load_file(app: &mut App, filename: &str) -> Result<(), String> {
             app.selection_anchor = None;
             app.hidden_rows.clear();
             if let Some(w) = result.warning { app.status_message = w; }
+            Ok(())
+        }
+        "parquet" => {
+            let view = crate::df_io::read_parquet(filename)?;
+            app.save_undo();
+            let mut s = crate::sheet::Sheet::new();
+            s.name = std::path::Path::new(filename)
+                .file_stem().and_then(|n| n.to_str()).unwrap_or("data").to_string();
+            s.df_view = Some(view);
+            app.sheet = s;
+            app.other_sheets = Vec::new();
+            app.active_sheet_index = 0;
+            app.cursor_col = 0; app.cursor_row = 0;
+            app.view_col = 0; app.view_row = 0;
+            app.selection_anchor = None;
+            app.hidden_rows.clear();
             Ok(())
         }
         _ => load_json(app, filename).map_err(|e| e.to_string()),

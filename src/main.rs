@@ -1,5 +1,7 @@
 mod cell;
 mod date_util;
+mod df_io;
+mod df_view;
 mod engine;
 mod formula;
 mod sheet;
@@ -57,6 +59,11 @@ pub enum DialogKind {
     BgColor,
     NumberFormat,
     ConditionalAdd,
+    AddComputedColumn,
+    OpenCsvAsDf,
+    SaveParquet,
+    SqlQuery,
+    GroupBy,
 }
 
 #[derive(Clone, Debug)]
@@ -699,10 +706,29 @@ impl App {
 
     /// Begin editing the current cell, optionally with an initial character.
     pub fn begin_edit(&mut self, initial: Option<char>, preserve: bool) {
-        let cell = self.sheet.get_cell(self.cursor_col, self.cursor_row);
-        self.edit_original = cell.raw_input.clone();
+        // In DataFrame view, the initial content comes from the DataFrame
+        // (header name for row 0, cell value otherwise). Out-of-bounds
+        // editing is silently rejected.
+        let existing = if let Some(view) = self.sheet.df_view.as_ref() {
+            if self.cursor_col >= view.cols() {
+                self.status_message = "範囲外のセルは編集できません".into();
+                return;
+            }
+            if self.cursor_row == 0 {
+                view.header(self.cursor_col)
+            } else if self.cursor_row - 1 < view.rows() {
+                view.value_at(self.cursor_col, self.cursor_row - 1)
+            } else {
+                self.status_message = "範囲外のセルは編集できません（行を追加する操作は未対応）".into();
+                return;
+            }
+        } else {
+            let cell = self.sheet.get_cell(self.cursor_col, self.cursor_row);
+            cell.raw_input.clone()
+        };
+        self.edit_original = existing.clone();
         if preserve {
-            self.input_buffer = cell.raw_input.clone();
+            self.input_buffer = existing;
         } else if let Some(c) = initial {
             self.input_buffer = c.to_string();
         } else {
@@ -715,6 +741,32 @@ impl App {
 
     /// Commit current edit input to the cell.
     pub fn commit_edit(&mut self) {
+        // DataFrame-view path: row 0 renames a column, other rows mutate
+        // the underlying typed cell. Aggregate autocomplete is skipped
+        // here because DataFrame cells aren't formulas.
+        if self.sheet.df_view.is_some() {
+            if self.input_buffer != self.edit_original {
+                self.save_undo();
+                let col = self.cursor_col;
+                let row = self.cursor_row;
+                let buf = self.input_buffer.clone();
+                let view = self.sheet.df_view.as_mut().unwrap();
+                let res = if row == 0 {
+                    crate::df_view::rename_column(view, col, &buf)
+                } else {
+                    crate::df_view::set_cell(view, col, row - 1, &buf)
+                };
+                if let Err(e) = res {
+                    self.status_message = format!("編集エラー: {}", e);
+                }
+            }
+            self.input_buffer.clear();
+            self.edit_cursor_pos = 0;
+            self.edit_original.clear();
+            self.point_mode = None;
+            return;
+        }
+
         // Auto-completion for aggregate formulas (=sum / =avg / =min / =max / =count / =counta).
         // If the user typed only the function name (with optional empty parens),
         // detect the contiguous numeric block above (preferred) or to the left
@@ -978,6 +1030,30 @@ impl App {
                 self.dialog = Some(Dialog::single(DialogKind::ExportCsv, "エクスポート先", ""));
                 self.mode = Mode::Dialog;
             }
+            Action::FileOpenCsvAsDf => {
+                self.dialog = Some(Dialog::single(
+                    DialogKind::OpenCsvAsDf,
+                    "CSV ファイル名 (Polars で読み込み、DataFrame ビューで開きます)",
+                    "",
+                ));
+                self.mode = Mode::Dialog;
+            }
+            Action::FileSaveParquet => {
+                let default_name = match &self.current_file {
+                    Some(path) => {
+                        let stem = std::path::Path::new(path).file_stem()
+                            .and_then(|s| s.to_str()).unwrap_or("data");
+                        format!("{}.parquet", stem)
+                    }
+                    None => "data.parquet".to_string(),
+                };
+                self.dialog = Some(Dialog::single(
+                    DialogKind::SaveParquet,
+                    "保存先 Parquet ファイル",
+                    default_name,
+                ));
+                self.mode = Mode::Dialog;
+            }
             Action::FilePrintHtml => {
                 let default_name = match &self.current_file {
                     Some(path) => {
@@ -1105,6 +1181,104 @@ impl App {
                 let prev = (self.active_sheet_index + total - 1) % total;
                 self.switch_sheet(prev);
                 self.status_message = format!("シート: {}", self.sheet.name);
+            }
+            Action::DataToDataframe => {
+                if self.sheet.is_df_view() {
+                    self.status_message = "既に DataFrame ビューです".into();
+                } else {
+                    match crate::df_view::cells_to_dataframe(&self.sheet) {
+                        Ok(v) => {
+                            let rows = v.rows();
+                            let cols = v.cols();
+                            let dtypes = v.dtype_summary(6);
+                            self.sheet.df_view = Some(v);
+                            self.cursor_col = 0;
+                            self.cursor_row = 0;
+                            self.selection_anchor = None;
+                            self.adjust_view();
+                            self.status_message = format!(
+                                "DataFrame ビュー: {} 行 × {} 列 ({})",
+                                rows, cols, dtypes
+                            );
+                        }
+                        Err(e) => {
+                            self.status_message = format!("DataFrame 変換エラー: {}", e);
+                        }
+                    }
+                }
+            }
+            Action::DataToCells => {
+                if !self.sheet.is_df_view() {
+                    self.status_message = "既にセルビューです".into();
+                } else if let Some(view) = self.sheet.df_view.clone() {
+                    // The cell store was preserved underneath during the
+                    // DataFrame view; just drop the view to reveal it.
+                    self.sheet.df_view = None;
+                    self.status_message = format!(
+                        "セルビューに戻しました ({} 行 × {} 列のデータを保持)",
+                        view.rows(), view.cols()
+                    );
+                }
+            }
+            Action::DataAddComputed => {
+                if !self.sheet.is_df_view() {
+                    self.status_message = "計算列は DataFrame ビューでのみ追加できます（データ → DataFrame ビューに変換）".into();
+                } else {
+                    self.dialog = Some(Dialog::multi(DialogKind::AddComputedColumn, vec![
+                        DialogField { label: "列名 (例: revenue)".into(), input: String::new() },
+                        DialogField { label: "式 (例: price * qty)".into(), input: String::new() },
+                    ]));
+                    self.mode = Mode::Dialog;
+                }
+            }
+            Action::DataSqlQuery => {
+                if !self.sheet.is_df_view() {
+                    self.status_message = "SQL クエリは DataFrame ビューでのみ使えます".into();
+                } else {
+                    self.dialog = Some(Dialog::single(
+                        DialogKind::SqlQuery,
+                        "SQL クエリ (例: SELECT * FROM df WHERE price > 100)",
+                        "SELECT * FROM df ".to_string(),
+                    ));
+                    self.mode = Mode::Dialog;
+                }
+            }
+            Action::DataGroupBy => {
+                if !self.sheet.is_df_view() {
+                    self.status_message = "グループ集計は DataFrame ビューでのみ使えます".into();
+                } else {
+                    self.dialog = Some(Dialog::multi(DialogKind::GroupBy, vec![
+                        DialogField {
+                            label: "グループ列 (カンマ区切り、例: category, region)".into(),
+                            input: String::new(),
+                        },
+                        DialogField {
+                            label: "集計 (col:func、例: amount:sum, score:avg)".into(),
+                            input: String::new(),
+                        },
+                    ]));
+                    self.mode = Mode::Dialog;
+                }
+            }
+            Action::DataClearComputed => {
+                if !self.sheet.is_df_view() {
+                    self.status_message = "DataFrame ビューではありません".into();
+                } else if let Some(view) = self.sheet.df_view.as_ref() {
+                    if view.computed.is_empty() {
+                        self.status_message = "計算列はありません".into();
+                    } else {
+                        match crate::df_view::clear_computed_columns(&self.sheet) {
+                            Ok(v) => {
+                                let n = view.computed.len();
+                                self.sheet.df_view = Some(v);
+                                self.status_message = format!("計算列 {} 件をクリアしました", n);
+                            }
+                            Err(e) => {
+                                self.status_message = format!("クリアエラー: {}", e);
+                            }
+                        }
+                    }
+                }
             }
             Action::DataFilterClear => {
                 let n = self.hidden_rows.len();
@@ -1403,6 +1577,107 @@ impl App {
                     Err(e) => {
                         self.status_message = format!("条件付き書式エラー: {}", e);
                     }
+                }
+            }
+            DialogKind::OpenCsvAsDf => {
+                let input = commands::sanitize_path_input(&input);
+                if input.is_empty() {
+                    self.status_message = "ファイル名が空です".into();
+                } else {
+                    match crate::df_io::read_csv_as_dataframe(&input) {
+                        Ok(view) => {
+                            self.save_undo();
+                            let stem = std::path::Path::new(&input)
+                                .file_stem().and_then(|n| n.to_str())
+                                .unwrap_or("data").to_string();
+                            let mut s = crate::sheet::Sheet::new();
+                            s.name = stem;
+                            let rows = view.rows();
+                            let cols = view.cols();
+                            s.df_view = Some(view);
+                            self.sheet = s;
+                            self.other_sheets = Vec::new();
+                            self.active_sheet_index = 0;
+                            self.cursor_col = 0; self.cursor_row = 0;
+                            self.view_col = 0; self.view_row = 0;
+                            self.selection_anchor = None;
+                            self.hidden_rows.clear();
+                            self.current_file = Some(input.clone());
+                            self.status_message = format!(
+                                "CSV を DataFrame として読込: {} 行 × {} 列", rows, cols
+                            );
+                        }
+                        Err(e) => {
+                            self.status_message = format!("CSV 読込エラー: {}", e);
+                        }
+                    }
+                }
+            }
+            DialogKind::SaveParquet => {
+                let input = commands::sanitize_path_input(&input);
+                if input.is_empty() {
+                    self.status_message = "ファイル名が空です".into();
+                } else {
+                    let view = if let Some(v) = self.sheet.df_view.clone() {
+                        Ok(v)
+                    } else {
+                        crate::df_view::cells_to_dataframe(&self.sheet)
+                    };
+                    match view {
+                        Ok(v) => {
+                            match crate::df_io::write_parquet(&v, &input) {
+                                Ok(()) => self.status_message = format!(
+                                    "{} に Parquet 保存: {} 行 × {} 列", input, v.rows(), v.cols()
+                                ),
+                                Err(e) => self.status_message = format!("Parquet 保存エラー: {}", e),
+                            }
+                        }
+                        Err(e) => self.status_message = format!("DataFrame 変換に失敗: {}", e),
+                    }
+                }
+            }
+            DialogKind::SqlQuery => {
+                if self.sheet.df_view.is_none() {
+                    self.status_message = "DataFrame ビューではありません".into();
+                } else {
+                    self.save_undo();
+                    let view = self.sheet.df_view.as_mut().unwrap();
+                    match crate::df_view::run_sql(view, &input) {
+                        Ok(msg) => self.status_message = msg,
+                        Err(e) => self.status_message = e,
+                    }
+                    self.cursor_col = 0; self.cursor_row = 0;
+                    self.view_col = 0; self.view_row = 0;
+                    self.selection_anchor = None;
+                }
+            }
+            DialogKind::GroupBy => {
+                let groups = dialog.fields.get(0).map(|f| f.input.clone()).unwrap_or_default();
+                let aggs = dialog.fields.get(1).map(|f| f.input.clone()).unwrap_or_default();
+                if self.sheet.df_view.is_none() {
+                    self.status_message = "DataFrame ビューではありません".into();
+                } else {
+                    self.save_undo();
+                    let view = self.sheet.df_view.as_mut().unwrap();
+                    match crate::df_view::run_group_by(view, &groups, &aggs) {
+                        Ok(msg) => self.status_message = msg,
+                        Err(e) => self.status_message = e,
+                    }
+                    self.cursor_col = 0; self.cursor_row = 0;
+                    self.view_col = 0; self.view_row = 0;
+                    self.selection_anchor = None;
+                }
+            }
+            DialogKind::AddComputedColumn => {
+                let name = dialog.fields.get(0).map(|f| f.input.clone()).unwrap_or_default();
+                let expr = dialog.fields.get(1).map(|f| f.input.clone()).unwrap_or_default();
+                if let Some(view) = self.sheet.df_view.as_mut() {
+                    match crate::df_view::add_computed_column(view, &name, &expr) {
+                        Ok(msg) => self.status_message = msg,
+                        Err(e) => self.status_message = e,
+                    }
+                } else {
+                    self.status_message = "DataFrame ビューではありません".to_string();
                 }
             }
             DialogKind::SheetRename => {

@@ -1,6 +1,6 @@
 [package]
 name = "tbla"
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 description = """
 tbla is a terminal spreadsheet editor with standard keyboard and mouse
@@ -28,3 +28,6 @@ rust_xlsxwriter = "0.92"
 # calamine already pulls in to avoid duplicate compilation.
 zip = { version = "4", default-features = false, features = ["deflate"] }
 quick-xml = "0.37"
+# Polars DataFrame view: typed columns for large analytical data.
+# Phase 1 uses csv/strings/dtype-full for type inference and value formatting.
+polars = { version = "0.53", default-features = false, features = ["lazy", "csv", "strings", "dtype-full", "fmt", "sql", "parquet", "new_streaming"] }
