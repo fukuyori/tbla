@@ -4,6 +4,24 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.2] - 2026-05-22
+
+### Fixed
+- **CSV / text / JSON load no longer fails with `stream did not contain
+  valid UTF-8`**. The native JSON loader and the CSV / TSV importer now
+  auto-detect the file encoding instead of assuming strict UTF-8:
+  1. **UTF-8 BOM** (`EF BB BF`) — stripped, decoded as UTF-8.
+  2. **UTF-16 LE / BE BOM** — decoded as UTF-16.
+  3. **Strict UTF-8** — used as-is if valid.
+  4. **Fallback: Shift-JIS / CP932** — covers Excel-on-Japanese-Windows
+     CSV exports, the most common non-UTF-8 case our users hit.
+
+  Unmappable bytes are replaced rather than failing — partial data beats a
+  hard error for a spreadsheet import.
+
+### New dependencies
+- `encoding_rs = "0.8"` for the Shift-JIS and UTF-16 codecs.
+
 ## [0.3.1] - 2026-05-17
 
 ### Added — Polars DataFrame view (analytical layer)

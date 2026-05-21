@@ -3225,12 +3225,13 @@ dependencies = [
 
 [[package]]
 name = "tbla"
-version = "0.3.1"
+version = "0.3.2"
 dependencies = [
  "arboard",
  "calamine",
  "chrono",
  "crossterm 0.27.0",
+ "encoding_rs",
  "polars",
  "quick-xml 0.37.5",
  "rust_xlsxwriter",

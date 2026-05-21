@@ -2,7 +2,7 @@ use crate::App;
 use crate::cell::CellValue;
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
@@ -57,6 +57,45 @@ struct CellData {
 
 fn is_default_alignment(a: &crate::cell::Alignment) -> bool { matches!(a, crate::cell::Alignment::Default) }
 fn is_false(b: &bool) -> bool { !*b }
+
+/// Read a text file and decode it to UTF-8 `String`, auto-detecting the
+/// encoding. Priority:
+/// 1. **UTF-8 BOM** (`EF BB BF`) → strip and decode as UTF-8.
+/// 2. **UTF-16 LE BOM** (`FF FE`) / **UTF-16 BE BOM** (`FE FF`) → decode as UTF-16.
+/// 3. **Valid UTF-8** (strict) → use as-is.
+/// 4. **Fallback to Shift-JIS / CP932** — covers Excel-on-Japanese-Windows
+///    CSV exports, the most common non-UTF-8 case our users hit.
+///
+/// If neither UTF-8 nor Shift-JIS produces a clean decode, we still return
+/// the Shift-JIS result (with replacement chars for unmappable bytes) rather
+/// than failing — partial data beats a hard error for a spreadsheet import.
+pub fn read_text_file_decoded(filename: &str) -> std::io::Result<String> {
+    let bytes = fs::read(filename)?;
+    Ok(decode_text_bytes(&bytes))
+}
+
+/// Pure helper for `read_text_file_decoded` — separated so it can be unit-tested.
+fn decode_text_bytes(bytes: &[u8]) -> String {
+    // BOM-based fast paths.
+    if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) {
+        return String::from_utf8_lossy(&bytes[3..]).into_owned();
+    }
+    if bytes.starts_with(&[0xFF, 0xFE]) {
+        let (cow, _, _) = encoding_rs::UTF_16LE.decode(&bytes[2..]);
+        return cow.into_owned();
+    }
+    if bytes.starts_with(&[0xFE, 0xFF]) {
+        let (cow, _, _) = encoding_rs::UTF_16BE.decode(&bytes[2..]);
+        return cow.into_owned();
+    }
+
+    // No BOM — strict UTF-8 first, then Shift-JIS / CP932 fallback.
+    if let Ok(s) = std::str::from_utf8(bytes) {
+        return s.to_string();
+    }
+    let (cow, _, _) = encoding_rs::SHIFT_JIS.decode(bytes);
+    cow.into_owned()
+}
 
 /// Normalize a user-supplied file path string from a dialog or CLI arg.
 /// Trims whitespace and strips one matching pair of surrounding `"` or `'`
@@ -650,9 +689,7 @@ fn save_json(app: &App, filename: &str) -> std::io::Result<()> {
 }
 
 fn load_json(app: &mut App, filename: &str) -> std::io::Result<()> {
-    let mut file = fs::File::open(filename)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    let contents = read_text_file_decoded(filename)?;
 
     // Try the new (multi-sheet) format first, fall back to the legacy
     // single-sheet format.
@@ -811,9 +848,7 @@ fn html_escape(s: &str) -> String {
 }
 
 fn import_csv(app: &mut App, filename: &str) -> std::io::Result<()> {
-    let mut file = fs::File::open(filename)?;
-    let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
+    let contents = read_text_file_decoded(filename)?;
 
     app.save_undo();
     app.sheet = crate::sheet::Sheet::new();
@@ -878,6 +913,36 @@ mod sanitize_tests {
     #[test]
     fn does_not_strip_mismatched() {
         assert_eq!(sanitize_path_input("\"C:\\a\\b.xlsx"), "\"C:\\a\\b.xlsx");
+    }
+
+    #[test]
+    fn decodes_utf8_no_bom() {
+        let bytes = "hello,世界\n".as_bytes();
+        assert_eq!(super::decode_text_bytes(bytes), "hello,世界\n");
+    }
+
+    #[test]
+    fn decodes_utf8_with_bom() {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice("a,b,c".as_bytes());
+        assert_eq!(super::decode_text_bytes(&bytes), "a,b,c");
+    }
+
+    #[test]
+    fn decodes_shift_jis_fallback() {
+        // "テスト,1,2" in Shift-JIS / CP932.
+        let bytes: &[u8] = &[
+            0x83, 0x65, 0x83, 0x58, 0x83, 0x67, // テスト
+            b',', b'1', b',', b'2',
+        ];
+        assert_eq!(super::decode_text_bytes(bytes), "テスト,1,2");
+    }
+
+    #[test]
+    fn decodes_utf16_le_with_bom() {
+        // BOM + "AB" in UTF-16 LE
+        let bytes: &[u8] = &[0xFF, 0xFE, b'A', 0x00, b'B', 0x00];
+        assert_eq!(super::decode_text_bytes(bytes), "AB");
     }
 
     #[test]

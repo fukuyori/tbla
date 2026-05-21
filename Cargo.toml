@@ -1,6 +1,6 @@
 [package]
 name = "tbla"
-version = "0.3.1"
+version = "0.3.2"
 edition = "2021"
 description = """
 tbla is a terminal spreadsheet editor with standard keyboard and mouse
@@ -23,6 +23,7 @@ arboard = "3.2"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 calamine = "0.30"
 rust_xlsxwriter = "0.92"
+encoding_rs = "0.8"
 # Used to hand-parse xl/styles.xml + sheet XML for cell formatting on read
 # (calamine only exposes values & formulas). Aligned with the versions
 # calamine already pulls in to avoid duplicate compilation.
