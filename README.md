@@ -28,7 +28,10 @@ menu bar at the top of the screen for file and edit operations.
 - **Formula adjustment** — References auto-update on row/column insert/delete
 - **Copy & paste** — Ctrl+C / Ctrl+X / Ctrl+V (also writes to system clipboard)
 - **Undo/Redo** — Ctrl+Z / Ctrl+Y
-- **File formats** — JSON (native), CSV/TSV, **Excel (.xlsx) read/write**
+- **File formats** — JSON (native), CSV/TSV, **Excel (.xlsx) read/write**, **Parquet read/write**
+- **Encoding auto-detection on read** — UTF-8 / UTF-8 BOM / UTF-16 / Shift-JIS / CP932 handled transparently for CSV / TSV / JSON. Japanese-Windows Excel CSV exports load without a manual conversion step.
+- **HTML table import from URL** — `データ → URLから取り込み...` fetches a page over HTTPS, lists its `<table>` elements with a preview, and loads the chosen one as a new sheet (or overwrites the current sheet). Auto-detects the page charset from `Content-Type` / `<meta>`.
+- **SQL query import** — `データ → SQL から取り込み...` runs a SELECT against PostgreSQL / MySQL / MariaDB / SQLite and loads the result into a sheet. Multi-DB via URI scheme (`postgresql://`, `mysql://`, `sqlite:///`).
 - **Unicode / IME support** — Proper handling of CJK characters and IME composition
 
 ## Installation

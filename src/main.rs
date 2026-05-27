@@ -10,6 +10,8 @@ mod commands;
 mod menu;
 mod xlsx;
 mod xlsx_styles;
+mod url_import;
+mod sql_import;
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -64,6 +66,14 @@ pub enum DialogKind {
     SaveParquet,
     SqlQuery,
     GroupBy,
+    /// Stage 1 of the URL-import flow: ask the user for the URL.
+    FromUrl,
+    /// Stage 2 of the URL-import flow: after the page is fetched and parsed,
+    /// the user picks which `<table>` to import (1-based index into
+    /// `pending_url_tables`) and where to put it (`s` = new sheet, `o` = overwrite).
+    FromUrlPickTable,
+    /// "データ → SQL から取り込み..." dialog. Fields: URI, query, destination.
+    FromSql,
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +168,18 @@ pub struct App {
     /// swap so call sites using `app.sheet` keep working transparently.
     pub other_sheets: Vec<Sheet>,
     pub active_sheet_index: usize,
+    /// Tables fetched by the URL-import flow, awaiting the user's pick.
+    /// Cleared once the second-stage dialog closes (committed or cancelled).
+    pub pending_url_tables: Vec<url_import::ExtractedTable>,
+    /// Source URL of `pending_url_tables` — used to name the new sheet when
+    /// the user picks "new sheet" and the table has no `<caption>`.
+    pub pending_url_source: String,
+    /// Last SQL connection URI used (session-only) — pre-filled into the
+    /// "SQL から取り込み" dialog so the user doesn't have to retype it
+    /// between queries.
+    pub last_sql_uri: String,
+    /// Last SQL query (session-only).
+    pub last_sql_query: String,
 }
 
 /// Point mode (Excel-style formula reference selection).
@@ -215,6 +237,10 @@ impl App {
             hidden_rows: std::collections::HashSet::new(),
             other_sheets: Vec::new(),
             active_sheet_index: 0,
+            pending_url_tables: Vec::new(),
+            pending_url_source: String::new(),
+            last_sql_uri: String::new(),
+            last_sql_query: String::new(),
         }
     }
 
@@ -1260,6 +1286,31 @@ impl App {
                     self.mode = Mode::Dialog;
                 }
             }
+            Action::DataFromUrl => {
+                self.dialog = Some(Dialog::single(
+                    DialogKind::FromUrl,
+                    "URL (http(s)://… 内の <table> を取り込みます)",
+                    "",
+                ));
+                self.mode = Mode::Dialog;
+            }
+            Action::DataFromSql => {
+                self.dialog = Some(Dialog::multi(DialogKind::FromSql, vec![
+                    DialogField {
+                        label: "接続URI (postgresql:// / mysql:// / sqlite:/// …)".into(),
+                        input: self.last_sql_uri.clone(),
+                    },
+                    DialogField {
+                        label: "SQL クエリ".into(),
+                        input: self.last_sql_query.clone(),
+                    },
+                    DialogField {
+                        label: "取り込み先 (s=新規シート / o=上書き)".into(),
+                        input: "s".into(),
+                    },
+                ]));
+                self.mode = Mode::Dialog;
+            }
             Action::DataClearComputed => {
                 if !self.sheet.is_df_view() {
                     self.status_message = "DataFrame ビューではありません".into();
@@ -1651,6 +1702,176 @@ impl App {
                     self.selection_anchor = None;
                 }
             }
+            DialogKind::FromUrl => {
+                let url = input.clone();
+                if url.is_empty() {
+                    // nothing to do
+                } else {
+                    self.status_message = format!("URL から取得中: {}", url);
+                    match url_import::fetch_url(&url) {
+                        Ok(html) => {
+                            let tables = url_import::extract_tables(&html);
+                            if tables.is_empty() {
+                                self.status_message =
+                                    "ページに <table> が見つかりませんでした".into();
+                            } else {
+                                // Build a multi-line preview of the tables.
+                                let mut preview_lines = Vec::new();
+                                for (i, t) in tables.iter().enumerate().take(20) {
+                                    let cap = t.caption.as_deref().unwrap_or("");
+                                    let cap_part = if cap.is_empty() {
+                                        String::new()
+                                    } else {
+                                        format!(" — {}", cap)
+                                    };
+                                    preview_lines.push(format!(
+                                        "{}: {}×{}{} [{}]",
+                                        i + 1,
+                                        t.row_count(),
+                                        t.col_count(),
+                                        cap_part,
+                                        t.preview(),
+                                    ));
+                                }
+                                let extra = if tables.len() > 20 {
+                                    format!(" (他 {} 件は省略)", tables.len() - 20)
+                                } else {
+                                    String::new()
+                                };
+                                self.status_message =
+                                    format!("{} 件のテーブルを検出{}", tables.len(), extra);
+                                self.pending_url_tables = tables;
+                                self.pending_url_source = url;
+                                self.dialog = Some(Dialog::multi(
+                                    DialogKind::FromUrlPickTable,
+                                    vec![
+                                        DialogField {
+                                            label: format!(
+                                                "テーブル番号 (1-{}) — {}",
+                                                self.pending_url_tables.len(),
+                                                preview_lines.join(" / "),
+                                            ),
+                                            input: "1".into(),
+                                        },
+                                        DialogField {
+                                            label: "取り込み先 (s=新規シート / o=上書き)".into(),
+                                            input: "s".into(),
+                                        },
+                                    ],
+                                ));
+                                self.mode = Mode::Dialog;
+                                // Keep dialog open — early-return out of commit
+                                // so the bottom of this function doesn't close it.
+                                return;
+                            }
+                        }
+                        Err(e) => {
+                            self.status_message = format!("URL 取得エラー: {}", e);
+                        }
+                    }
+                }
+            }
+            DialogKind::FromUrlPickTable => {
+                let idx_str = dialog.fields.get(0)
+                    .map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let dest = dialog.fields.get(1)
+                    .map(|f| f.input.trim().to_lowercase()).unwrap_or_default();
+                let total = self.pending_url_tables.len();
+                let idx = idx_str.parse::<usize>().ok()
+                    .filter(|n| *n >= 1 && *n <= total);
+                match idx {
+                    None => {
+                        self.status_message = format!(
+                            "テーブル番号は 1 〜 {} の整数で指定してください",
+                            total
+                        );
+                    }
+                    Some(n) => {
+                        let table = self.pending_url_tables[n - 1].clone();
+                        let sheet_name = table
+                            .caption
+                            .clone()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or_else(|| {
+                                derive_sheet_name_from_url(&self.pending_url_source, n)
+                            });
+                        let overwrite = dest.starts_with('o');
+                        self.save_undo();
+                        if overwrite {
+                            let mut new_sheet = crate::sheet::Sheet::new();
+                            new_sheet.name = sheet_name.clone();
+                            populate_sheet_from_table(&mut new_sheet, &table);
+                            self.sheet = new_sheet;
+                            self.cursor_col = 0;
+                            self.cursor_row = 0;
+                            self.view_col = 0;
+                            self.view_row = 0;
+                            self.selection_anchor = None;
+                            self.status_message = format!(
+                                "テーブル {} を読み込みました ({} 行 × {} 列, 上書き)",
+                                n, table.row_count(), table.col_count(),
+                            );
+                        } else {
+                            let actual_name = self.add_sheet(Some(sheet_name));
+                            populate_sheet_from_table(&mut self.sheet, &table);
+                            self.status_message = format!(
+                                "テーブル {} を新規シート \"{}\" に読み込みました ({} 行 × {} 列)",
+                                n, actual_name, table.row_count(), table.col_count(),
+                            );
+                        }
+                        self.pending_url_tables.clear();
+                        self.pending_url_source.clear();
+                    }
+                }
+            }
+            DialogKind::FromSql => {
+                let uri = dialog.fields.get(0)
+                    .map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let query = dialog.fields.get(1)
+                    .map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let dest = dialog.fields.get(2)
+                    .map(|f| f.input.trim().to_lowercase()).unwrap_or_default();
+                if uri.is_empty() || query.is_empty() {
+                    self.status_message = "接続URI と SQL クエリの両方を入力してください".into();
+                } else {
+                    self.status_message = "クエリ実行中…".into();
+                    match sql_import::run_query(&uri, &query) {
+                        Ok(result) => {
+                            // Remember inputs for next time.
+                            self.last_sql_uri = uri.clone();
+                            self.last_sql_query = query.clone();
+                            let sheet_name = derive_sheet_name_from_sql_uri(&uri);
+                            let overwrite = dest.starts_with('o');
+                            self.save_undo();
+                            if overwrite {
+                                let mut new_sheet = crate::sheet::Sheet::new();
+                                new_sheet.name = sheet_name.clone();
+                                populate_sheet_from_query_result(&mut new_sheet, &result);
+                                self.sheet = new_sheet;
+                                self.cursor_col = 0;
+                                self.cursor_row = 0;
+                                self.view_col = 0;
+                                self.view_row = 0;
+                                self.selection_anchor = None;
+                                self.status_message = format!(
+                                    "SQL 結果を読み込みました ({} 行 × {} 列, 上書き)",
+                                    result.row_count(), result.col_count(),
+                                );
+                            } else {
+                                let actual_name = self.add_sheet(Some(sheet_name));
+                                populate_sheet_from_query_result(&mut self.sheet, &result);
+                                self.status_message = format!(
+                                    "SQL 結果を新規シート \"{}\" に読み込みました ({} 行 × {} 列)",
+                                    actual_name, result.row_count(), result.col_count(),
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            self.status_message = format!("SQL エラー: {}", e);
+                        }
+                    }
+                }
+            }
             DialogKind::GroupBy => {
                 let groups = dialog.fields.get(0).map(|f| f.input.clone()).unwrap_or_default();
                 let aggs = dialog.fields.get(1).map(|f| f.input.clone()).unwrap_or_default();
@@ -1806,6 +2027,78 @@ fn parse_conditional_format(range_in: &str, cond_in: &str, color_in: &str)
         text_color: None,
         bg_color,
     })
+}
+
+/// Populate an empty `Sheet` from an `ExtractedTable` (URL import).
+fn populate_sheet_from_table(sheet: &mut Sheet, table: &url_import::ExtractedTable) {
+    for (row, cells) in table.rows.iter().enumerate() {
+        for (col, value) in cells.iter().enumerate() {
+            if !value.is_empty() {
+                sheet.set_cell(col, row, value.clone());
+            }
+        }
+    }
+}
+
+/// Populate a sheet from a SQL `QueryResult`. Row 0 = column names; data
+/// rows follow. Empty cells stay empty (so `Cell::value` is `Empty`).
+fn populate_sheet_from_query_result(sheet: &mut Sheet, result: &sql_import::QueryResult) {
+    for (col, name) in result.columns.iter().enumerate() {
+        if !name.is_empty() {
+            sheet.set_cell(col, 0, name.clone());
+        }
+    }
+    for (row_idx, row) in result.rows.iter().enumerate() {
+        for (col, value) in row.iter().enumerate() {
+            if !value.is_empty() {
+                sheet.set_cell(col, row_idx + 1, value.clone());
+            }
+        }
+    }
+}
+
+/// Pick a sheet name from the SQL connection URI. For `postgresql://h/db`
+/// we use `db`; falls back to the host, then to `"SQL"`. Trimmed to 31 chars.
+fn derive_sheet_name_from_sql_uri(uri: &str) -> String {
+    let without_scheme = uri.split_once("://").map(|(_, r)| r).unwrap_or(uri);
+    // strip credentials@
+    let after_creds = without_scheme.rsplit_once('@').map(|(_, r)| r).unwrap_or(without_scheme);
+    // database name is the last path segment (before any ?query)
+    let path = after_creds.split_once('/').map(|(_, p)| p).unwrap_or("");
+    let path_no_query = path.split('?').next().unwrap_or("");
+    let candidate = if !path_no_query.is_empty() {
+        // For sqlite paths take just the file stem; otherwise the last segment.
+        let last = path_no_query.rsplit(['/', '\\']).next().unwrap_or(path_no_query);
+        let stem = last.rsplit_once('.').map(|(s, _)| s).unwrap_or(last);
+        stem.to_string()
+    } else {
+        // No path: use host
+        after_creds.split(['/','?',':']).next().unwrap_or("SQL").to_string()
+    };
+    let candidate = if candidate.is_empty() { "SQL".to_string() } else { candidate };
+    let mut out: String = candidate.chars().take(31).collect();
+    if out.is_empty() { out = "SQL".to_string(); }
+    out
+}
+
+/// Pick a reasonable sheet name from the source URL when the table has no
+/// `<caption>`. `host` or `host/path[N]` keeps it human-readable; the
+/// 31-char Excel sheet-name limit is respected.
+fn derive_sheet_name_from_url(url: &str, table_index_1based: usize) -> String {
+    // Crude parse: strip scheme, take everything up to the first '/'.
+    let without_scheme = url.split_once("://").map(|(_, rest)| rest).unwrap_or(url);
+    let (host, _path) = without_scheme.split_once('/').unwrap_or((without_scheme, ""));
+    let base = if host.is_empty() { "URL" } else { host };
+    let candidate = format!("{}[{}]", base, table_index_1based);
+    if candidate.chars().count() <= 31 {
+        candidate
+    } else {
+        // Trim host to fit within 31 chars including the [N] suffix.
+        let suffix = format!("[{}]", table_index_1based);
+        let allowed = 31usize.saturating_sub(suffix.chars().count());
+        let trimmed: String = base.chars().take(allowed).collect();
+        format!("{}{}", trimmed, suffix)
+    }
 }
 
 /// Return true if the given cell holds a number (or a formula that evaluates

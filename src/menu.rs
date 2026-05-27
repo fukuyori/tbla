@@ -41,6 +41,8 @@ pub enum Action {
     DataClearComputed,
     DataSqlQuery,
     DataGroupBy,
+    DataFromUrl,
+    DataFromSql,
 
     SheetNew,
     SheetDelete,
@@ -376,6 +378,19 @@ impl MenuBar {
                         mnemonic: Some('G'),
                         shortcut: None,
                         action: Action::DataGroupBy,
+                    },
+                    SubItem::Separator,
+                    SubItem::Item {
+                        label: "URLから取り込み...".to_string(),
+                        mnemonic: Some('U'),
+                        shortcut: None,
+                        action: Action::DataFromUrl,
+                    },
+                    SubItem::Item {
+                        label: "SQL から取り込み...".to_string(),
+                        mnemonic: Some('L'),
+                        shortcut: None,
+                        action: Action::DataFromSql,
                     },
                 ],
             },

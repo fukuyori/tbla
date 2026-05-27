@@ -1,6 +1,6 @@
 [package]
 name = "tbla"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 description = """
 tbla is a terminal spreadsheet editor with standard keyboard and mouse
@@ -24,6 +24,18 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 calamine = "0.30"
 rust_xlsxwriter = "0.92"
 encoding_rs = "0.8"
+# HTML table import from URL (データ → URLから取り込み...).
+# ureq: synchronous HTTP/HTTPS client (rustls TLS, no async runtime).
+# scraper: html5ever-based DOM/CSS-selector parser.
+ureq = { version = "2", features = ["tls"] }
+scraper = "0.20"
+# SQL import (データ → SQL から取り込み...): per-DB sync clients. Adds
+# ~3.5 MB to the binary, no native runtime deps (sqlite is bundled, MySQL
+# brings its own protocol). PostgreSQL TLS is intentionally off in v1 —
+# add postgres-native-tls / postgres-rustls if needed for cloud DBs.
+rusqlite = { version = "0.31", features = ["bundled"] }
+postgres = "0.19"
+mysql = { version = "25", default-features = false, features = ["minimal", "rustls-tls"] }
 # Used to hand-parse xl/styles.xml + sheet XML for cell formatting on read
 # (calamine only exposes values & formulas). Aligned with the versions
 # calamine already pulls in to avoid duplicate compilation.

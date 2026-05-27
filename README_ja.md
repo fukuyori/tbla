@@ -27,7 +27,10 @@ tbla はターミナル上で動作する表計算エディタです。馴染み
 - **数式の自動補正** — 行・列の挿入・削除時に参照を自動調整
 - **コピー＆ペースト** — Ctrl+C / Ctrl+X / Ctrl+V（システムクリップボード連携）
 - **Undo/Redo** — Ctrl+Z / Ctrl+Y
-- **ファイル形式** — JSON（ネイティブ）、CSV/TSV、**Excel (.xlsx) 入出力**
+- **ファイル形式** — JSON（ネイティブ）、CSV/TSV、**Excel (.xlsx) 入出力**、**Parquet 入出力**
+- **文字コード自動判定** — CSV / TSV / JSON 読み込み時に UTF-8 / UTF-8 BOM / UTF-16 / Shift-JIS / CP932 を自動判別。Excel から書き出した日本語 Windows の Shift-JIS CSV もそのまま開けます
+- **URL から HTML テーブル取り込み** — `データ → URLから取り込み...` で Web ページの `<table>` を一覧表示し、プレビューから選んで取り込み（新規シート / 上書きを毎回確認）。ページの文字コードは `Content-Type` / `<meta>` から自動判定
+- **SQL クエリ取り込み** — `データ → SQL から取り込み...` で PostgreSQL / MySQL / MariaDB / SQLite に SELECT を投げて結果をシートに読み込み。URI スキーム (`postgresql://` / `mysql://` / `sqlite:///`) で DB を自動振り分け
 - **日本語/IME 対応** — 全角文字の正しい表示と、編集セル位置への IME 合成ウィンドウ表示
 
 ## インストール

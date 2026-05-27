@@ -4,6 +4,61 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.3.3] - 2026-05-22
+
+### Added — HTML table import from URL
+- `データ → URLから取り込み...` (`Alt+D`, `U`) fetches a web page and
+  extracts its `<table>` elements into a sheet.
+- **Two-stage dialog**:
+  1. URL を入力
+  2. ページ取得後、検出されたテーブル一覧（行数 × 列数 / `<caption>` / 先頭行プレビュー）が
+     表示され、テーブル番号と取り込み先（`s` = 新規シート / `o` = 上書き）を選択
+- **Charset auto-detection**: HTTP `Content-Type: charset=...` → UTF-8 BOM →
+  `<meta charset>` → strict UTF-8 → Shift-JIS / CP932 フォールバック。
+  日本語サイトの Shift-JIS ページもそのまま読み込めます。
+- **Sheet naming**: テーブルに `<caption>` があればそれをシート名に、無ければ
+  ホスト名 + テーブル番号（例: `example.com[2]`）を採用（Excel の 31 文字制限内に収める）。
+- **Sane limits**: HTTP timeout 30 秒、ボディ上限 20 MB、UA は `tbla/<version> (table import)`。
+- **Caveats (v1)**: `colspan` / `rowspan` は未展開（ソースのテキストをそのまま 1 セルに格納）。
+
+### Added — SQL query import (read-only)
+- `データ → SQL から取り込み...` (`Alt+D`, `L`) runs a SELECT against a
+  PostgreSQL / MySQL / MariaDB / SQLite database and loads the result into
+  a sheet.
+- **Multi-DB via URI scheme**:
+  - `postgresql://user:pass@host:5432/db` / `postgres://…`
+  - `mysql://user:pass@host:3306/db` / `mariadb://…` (rustls TLS supported)
+  - `sqlite:///path/to/file.db` / `sqlite3://…` / `file://…`, or a bare
+    path ending in `.sqlite` / `.sqlite3` / `.db` (e.g. `data.sqlite` or
+    `C:\Users\me\data.db`); `:memory:` also works
+- **Dialog**: three fields — URI, SQL query, destination (`s` = 新規シート /
+  `o` = 上書き). The URI and query are remembered for the next call within
+  the session so iterating is quick.
+- **Result shape**: row 0 = column names, then one row per result row.
+  `NULL` becomes an empty cell. Binary / unsupported types are surfaced
+  as `<bytea N bytes>` / `<{type-name}>` markers so they don't break
+  display.
+- **Sheet name**: derived from the URI's last path segment (database name
+  for postgres/mysql, file stem for sqlite), trimmed to 31 chars.
+
+### New dependencies
+- `ureq = "2"` (with `tls` feature → rustls) for synchronous HTTPS GET.
+- `scraper = "0.20"` for HTML / CSS-selector parsing.
+- `rusqlite = "0.31"` with `bundled` feature (SQLite compiled in, no
+  system library required).
+- `postgres = "0.19"` (sync). **TLS intentionally off in v1** — works for
+  local / VPC databases out of the box; cloud-managed Postgres requiring
+  TLS will need a follow-up enabling `postgres-native-tls` or
+  `postgres-rustls`.
+- `mysql = "25"` with `rustls-tls`. TLS works automatically when the
+  server requires it.
+
+### Notes
+- Adds ~3.5 MB to the binary and ~30 s to a clean build (first time the
+  TLS / SQL crates compile).
+- The SQL query field is single-line. For multi-statement work, use a view /
+  stored procedure or a single `SELECT` per import.
+
 ## [0.3.2] - 2026-05-22
 
 ### Fixed
