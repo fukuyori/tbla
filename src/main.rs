@@ -12,6 +12,7 @@ mod xlsx;
 mod xlsx_styles;
 mod url_import;
 mod sql_import;
+mod width;
 
 use crossterm::{
     cursor::{Hide, Show},
@@ -698,8 +699,7 @@ impl App {
         // separated by single spaces.
         let mut x = 0u16;
         for (idx, sheet) in self.workbook_sheets().iter().enumerate() {
-            use unicode_width::UnicodeWidthStr;
-            let label_width = UnicodeWidthStr::width(format!(" {} ", sheet.name).as_str()) as u16;
+            let label_width = crate::width::str_width(format!(" {} ", sheet.name).as_str()) as u16;
             if screen_col >= x && screen_col < x + label_width {
                 return Some(idx);
             }
@@ -824,27 +824,64 @@ impl App {
         let clip = self.clipboard.clone().unwrap();
         self.save_undo();
 
-        let paste_col = self.cursor_col;
-        let paste_row = self.cursor_row;
+        let w = clip.width;
+        let h = clip.height;
 
-        for (r_offset, row_data) in clip.cells.iter().enumerate() {
-            for (c_offset, (raw_input, _value)) in row_data.iter().enumerate() {
-                let dst_col = paste_col + c_offset;
-                let dst_row = paste_row + r_offset;
+        // Decide where to paste and how big the target is. When a multi-cell
+        // selection is active and larger than the clipboard, fill the whole
+        // selection — extending arithmetic/text-number series so the increment
+        // (増減) is carried through, Excel-style. Otherwise just drop the block
+        // at the cursor (origin = selection top-left, which is the cursor when
+        // there's no selection).
+        let (sel_min_c, sel_min_r, sel_max_c, sel_max_r) = self.get_selection_bounds();
+        let origin_col = sel_min_c;
+        let origin_row = sel_min_r;
+        let (dest_w, dest_h) = if self.has_selection() {
+            (
+                (sel_max_c - sel_min_c + 1).max(w),
+                (sel_max_r - sel_min_r + 1).max(h),
+            )
+        } else {
+            (w, h)
+        };
 
-                let adjusted = if raw_input.starts_with('=') {
-                    let col_delta = (dst_col as isize) - (clip.start_col as isize) - (c_offset as isize);
-                    let row_delta = (dst_row as isize) - (clip.start_row as isize) - (r_offset as isize);
-                    formula::adjust_formula(raw_input, col_delta, row_delta)
-                } else {
-                    raw_input.clone()
+        // Primary fill direction. A taller target extends each column downward
+        // (and tiles columns sideways); otherwise a wider target extends each
+        // row rightward (tiling rows downward). When the target matches the
+        // clipboard size, this is a plain block paste.
+        let vertical_fill = dest_h > h;
+        let horizontal_fill = dest_w > w;
+
+        for co in 0..dest_w {
+            for ro in 0..dest_h {
+                let dst_col = origin_col + co;
+                let dst_row = origin_row + ro;
+
+                let raw = match compute_fill(&clip, co, ro, vertical_fill, horizontal_fill) {
+                    FillCell::Source { sc, sr } => {
+                        let src = &clip.cells[sr][sc].0;
+                        if src.starts_with('=') {
+                            let col_delta =
+                                dst_col as isize - (clip.start_col + sc) as isize;
+                            let row_delta =
+                                dst_row as isize - (clip.start_row + sr) as isize;
+                            formula::adjust_formula(src, col_delta, row_delta)
+                        } else {
+                            src.clone()
+                        }
+                    }
+                    FillCell::Literal(s) => s,
                 };
 
-                self.sheet.set_cell(dst_col, dst_row, adjusted);
+                self.sheet.set_cell(dst_col, dst_row, raw);
             }
         }
 
-        self.status_message = format!("貼り付け: {}x{} セル", clip.width, clip.height);
+        if dest_w > w || dest_h > h {
+            self.status_message = format!("連続貼り付け: {}x{} セル", dest_w, dest_h);
+        } else {
+            self.status_message = format!("貼り付け: {}x{} セル", w, h);
+        }
     }
 
     fn paste_from_system(&mut self) {
@@ -2438,6 +2475,152 @@ fn detect_aggregate_range(
 /// `=MIN()`, or `=Average( )`, build a completed formula with the auto-detected
 /// range. Returns None when no completion applies (already has arguments, not
 /// a supported function, or no adjacent numeric data).
+/// One destination cell produced by the series-aware paste. Either copied
+/// from a source cell (so formula references can be re-based relative to the
+/// paste position) or a freshly-computed literal value from extending a series.
+enum FillCell {
+    Source { sc: usize, sr: usize },
+    Literal(String),
+}
+
+/// Decide what goes into the destination cell at clipboard-relative offset
+/// `(co, ro)`. Inside the original block it returns the matching source cell;
+/// beyond it, it extends the series along the primary fill direction, falling
+/// back to tiling (repeat) when no numeric/text-number pattern is detected.
+fn compute_fill(
+    clip: &ClipboardContent,
+    co: usize,
+    ro: usize,
+    vertical_fill: bool,
+    horizontal_fill: bool,
+) -> FillCell {
+    let w = clip.width;
+    let h = clip.height;
+
+    if vertical_fill {
+        let sc = co % w; // tile columns sideways
+        if ro < h {
+            return FillCell::Source { sc, sr: ro };
+        }
+        let values: Vec<crate::cell::CellValue> =
+            (0..h).map(|r| clip.cells[r][sc].1.clone()).collect();
+        let raws: Vec<String> = (0..h).map(|r| clip.cells[r][sc].0.clone()).collect();
+        if let Some(s) = extrapolate_series(&values, &raws, ro) {
+            return FillCell::Literal(s);
+        }
+        FillCell::Source { sc, sr: ro % h }
+    } else if horizontal_fill {
+        let sr = ro % h; // tile rows downward
+        if co < w {
+            return FillCell::Source { sc: co, sr };
+        }
+        let values: Vec<crate::cell::CellValue> =
+            (0..w).map(|c| clip.cells[sr][c].1.clone()).collect();
+        let raws: Vec<String> = (0..w).map(|c| clip.cells[sr][c].0.clone()).collect();
+        if let Some(s) = extrapolate_series(&values, &raws, co) {
+            return FillCell::Literal(s);
+        }
+        FillCell::Source { sc: co % w, sr }
+    } else {
+        // Plain block paste (target == clipboard size).
+        FillCell::Source { sc: co % w, sr: ro % h }
+    }
+}
+
+/// Extend a series of `values`/`raws` (length n) to index `idx >= n`.
+/// Tries an arithmetic numeric progression first, then a "text + trailing
+/// integer" progression. Returns None when neither applies (caller tiles).
+fn extrapolate_series(
+    values: &[crate::cell::CellValue],
+    raws: &[String],
+    idx: usize,
+) -> Option<String> {
+    numeric_extrapolate(values, idx).or_else(|| text_number_extrapolate(raws, idx))
+}
+
+/// Linear extrapolation of an all-numeric line. Needs at least two values so a
+/// step can be derived; a single value has no defined increment (Excel repeats
+/// it, which is handled by the tiling fallback).
+fn numeric_extrapolate(values: &[crate::cell::CellValue], idx: usize) -> Option<String> {
+    let n = values.len();
+    if n < 2 {
+        return None;
+    }
+    let nums: Vec<f64> = values
+        .iter()
+        .map(|v| match v {
+            crate::cell::CellValue::Number(x) => Some(*x),
+            _ => None,
+        })
+        .collect::<Option<Vec<_>>>()?;
+    let step = (nums[n - 1] - nums[0]) / (n as f64 - 1.0);
+    Some(format_fill_number(nums[0] + step * idx as f64))
+}
+
+/// Extend a line of strings that share a common prefix and end in an integer
+/// (e.g. "Item1", "Item2" → "Item3"). Skips formulas. The numeric suffix
+/// follows the same linear step as the numeric case.
+fn text_number_extrapolate(raws: &[String], idx: usize) -> Option<String> {
+    let n = raws.len();
+    if n < 2 {
+        return None;
+    }
+    if raws.iter().any(|s| s.trim_start().starts_with('=')) {
+        return None;
+    }
+    let parsed: Vec<(String, i64, usize)> = raws
+        .iter()
+        .map(|s| split_trailing_int(s))
+        .collect::<Option<Vec<_>>>()?;
+    let prefix = &parsed[0].0;
+    if !parsed.iter().all(|(p, _, _)| p == prefix) {
+        return None;
+    }
+    let first = parsed[0].1 as f64;
+    let last = parsed[n - 1].1 as f64;
+    let step = (last - first) / (n as f64 - 1.0);
+    let val = (first + step * idx as f64).round() as i64;
+    // Preserve zero-padding width when every sample shares it (e.g. 01, 02).
+    let width = parsed[0].2;
+    let pad = if width > 0 && parsed.iter().all(|(_, _, w)| *w == width) {
+        width
+    } else {
+        0
+    };
+    if val >= 0 && pad > 0 {
+        Some(format!("{}{:0>pad$}", prefix, val, pad = pad))
+    } else {
+        Some(format!("{}{}", prefix, val))
+    }
+}
+
+/// Split a string into (prefix, trailing integer, digit-width). Returns None
+/// when there's no trailing run of ASCII digits. The sign is treated as part
+/// of the prefix so widths stay simple and round-trips are stable.
+fn split_trailing_int(s: &str) -> Option<(String, i64, usize)> {
+    // ASCII digits are one byte each, so the count is also a byte offset.
+    let digit_count = s.chars().rev().take_while(|c| c.is_ascii_digit()).count();
+    if digit_count == 0 {
+        return None;
+    }
+    let digit_start = s.len() - digit_count;
+    let digits = &s[digit_start..];
+    let num: i64 = digits.parse().ok()?;
+    Some((s[..digit_start].to_string(), num, digit_count))
+}
+
+/// Render an extrapolated number back to a cell input: whole numbers as
+/// integers, otherwise trimmed to a sensible number of decimals.
+fn format_fill_number(n: f64) -> String {
+    if n.is_finite() && (n - n.round()).abs() < 1e-9 {
+        format!("{}", n.round() as i64)
+    } else {
+        let s = format!("{:.10}", n);
+        let s = s.trim_end_matches('0').trim_end_matches('.');
+        s.to_string()
+    }
+}
+
 fn autocomplete_aggregate(
     sheet: &Sheet,
     input: &str,
@@ -2721,6 +2904,122 @@ fn cycle_ref_token(token: &str) -> Option<String> {
         })
         .collect();
     Some(rebuilt.join(":"))
+}
+
+#[cfg(test)]
+mod series_paste_tests {
+    use super::*;
+    use crate::cell::CellValue;
+
+    /// Build a ClipboardContent from a column of raw inputs at A1 (0,0).
+    fn clip_col(raws: &[&str]) -> ClipboardContent {
+        let cells: Vec<Vec<(String, CellValue)>> = raws
+            .iter()
+            .map(|s| vec![(s.to_string(), crate::cell::parse_input(s))])
+            .collect();
+        ClipboardContent { cells, start_col: 0, start_row: 0, width: 1, height: raws.len() }
+    }
+
+    /// Build a ClipboardContent from a single row of raw inputs at A1.
+    fn clip_row(raws: &[&str]) -> ClipboardContent {
+        let row: Vec<(String, CellValue)> = raws
+            .iter()
+            .map(|s| (s.to_string(), crate::cell::parse_input(s)))
+            .collect();
+        ClipboardContent { cells: vec![row], start_col: 0, start_row: 0, width: raws.len(), height: 1 }
+    }
+
+    /// Resolve the literal a vertical fill would place at row offset `ro`.
+    fn vfill(clip: &ClipboardContent, ro: usize) -> String {
+        match compute_fill(clip, 0, ro, true, false) {
+            FillCell::Literal(s) => s,
+            FillCell::Source { sc, sr } => clip.cells[sr][sc].0.clone(),
+        }
+    }
+
+    fn hfill(clip: &ClipboardContent, co: usize) -> String {
+        match compute_fill(clip, co, 0, false, true) {
+            FillCell::Literal(s) => s,
+            FillCell::Source { sc, sr } => clip.cells[sr][sc].0.clone(),
+        }
+    }
+
+    #[test]
+    fn numeric_step_one() {
+        let c = clip_col(&["1", "2"]);
+        assert_eq!(vfill(&c, 0), "1");
+        assert_eq!(vfill(&c, 1), "2");
+        assert_eq!(vfill(&c, 2), "3");
+        assert_eq!(vfill(&c, 5), "6");
+    }
+
+    #[test]
+    fn numeric_step_two() {
+        let c = clip_col(&["2", "4"]);
+        assert_eq!(vfill(&c, 2), "6");
+        assert_eq!(vfill(&c, 3), "8");
+    }
+
+    #[test]
+    fn numeric_decreasing() {
+        let c = clip_col(&["10", "8"]);
+        assert_eq!(vfill(&c, 2), "6");
+        assert_eq!(vfill(&c, 3), "4");
+    }
+
+    #[test]
+    fn numeric_fractional_step() {
+        let c = clip_col(&["1", "1.5"]);
+        assert_eq!(vfill(&c, 2), "2");
+        assert_eq!(vfill(&c, 3), "2.5");
+    }
+
+    #[test]
+    fn single_numeric_repeats() {
+        // No second sample → no defined increment → tile (repeat).
+        let c = clip_col(&["7"]);
+        assert_eq!(vfill(&c, 1), "7");
+        assert_eq!(vfill(&c, 2), "7");
+    }
+
+    #[test]
+    fn text_with_trailing_number() {
+        let c = clip_col(&["Item1", "Item2"]);
+        assert_eq!(vfill(&c, 2), "Item3");
+        assert_eq!(vfill(&c, 4), "Item5");
+    }
+
+    #[test]
+    fn text_zero_padded() {
+        let c = clip_col(&["No01", "No02"]);
+        assert_eq!(vfill(&c, 2), "No03");
+        assert_eq!(vfill(&c, 9), "No10");
+    }
+
+    #[test]
+    fn plain_text_tiles() {
+        let c = clip_col(&["a", "b"]);
+        assert_eq!(vfill(&c, 2), "a"); // 2 % 2
+        assert_eq!(vfill(&c, 3), "b");
+    }
+
+    #[test]
+    fn formulas_tile_not_series() {
+        // Formulas must not be treated as text-number series; they tile and the
+        // paste loop re-bases their references separately.
+        let c = clip_col(&["=A1+1", "=A2+1"]);
+        match compute_fill(&c, 0, 2, true, false) {
+            FillCell::Source { sc, sr } => { assert_eq!((sc, sr), (0, 0)); }
+            FillCell::Literal(s) => panic!("expected tiled source, got literal {s}"),
+        }
+    }
+
+    #[test]
+    fn horizontal_fill_extends_right() {
+        let c = clip_row(&["1", "2"]);
+        assert_eq!(hfill(&c, 2), "3");
+        assert_eq!(hfill(&c, 4), "5");
+    }
 }
 
 fn handle_key(app: &mut App, key: KeyEvent) {
@@ -3433,6 +3732,19 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
     }
 }
 
+/// Probe whether the terminal renders East Asian Ambiguous characters as
+/// double width: print one at the origin and read back the cursor column.
+/// Runs on the alternate screen before the first draw, so nothing visible
+/// survives. Returns None if the terminal doesn't answer the position query.
+fn probe_ambiguous_wide(stdout: &mut impl std::io::Write) -> Option<bool> {
+    use crossterm::cursor::MoveTo;
+    execute!(stdout, MoveTo(0, 0)).ok()?;
+    write!(stdout, "○").ok()?;
+    stdout.flush().ok()?;
+    let (col, _) = crossterm::cursor::position().ok()?;
+    Some(col >= 2)
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
@@ -3451,6 +3763,17 @@ fn main() -> Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
+
+    // Decide how East Asian Ambiguous characters (①, ○, →, ─, …) are
+    // counted. They render double-width in many Japanese terminal setups and
+    // single-width elsewhere, so the wrong guess misaligns the grid.
+    // TBLA_AMBIGUOUS_WIDE=1/0 forces the mode; otherwise print one on the
+    // alternate screen and ask the terminal where the cursor landed.
+    let ambiguous_wide = match std::env::var("TBLA_AMBIGUOUS_WIDE") {
+        Ok(v) => matches!(v.trim(), "1" | "true" | "yes" | "on"),
+        Err(_) => probe_ambiguous_wide(&mut stdout).unwrap_or(false),
+    };
+    width::set_ambiguous_wide(ambiguous_wide);
 
     let mut app = App::new();
 

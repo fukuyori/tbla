@@ -5,7 +5,6 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use serde::{Deserialize, Serialize};
-use unicode_width::UnicodeWidthStr;
 
 /// JSON file format for tbla (multi-sheet, version 2). The single-sheet
 /// version 1 format is still read for backward compatibility.
@@ -241,11 +240,11 @@ fn calc_column_width(app: &App, col: usize, max_row: usize, min_width: usize, ma
     let mut width = min_width;
 
     let col_name = crate::formula::col_to_name(col);
-    width = width.max(UnicodeWidthStr::width(col_name.as_str()) + 2);
+    width = width.max(crate::width::str_width(col_name.as_str()) + 2);
 
     for row in 0..=max_row {
         let value = app.sheet.evaluate(col, row);
-        let cell_width = UnicodeWidthStr::width(value.as_str()) + 2;
+        let cell_width = crate::width::str_width(value.as_str()) + 2;
         width = width.max(cell_width);
     }
 

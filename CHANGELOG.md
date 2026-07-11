@@ -4,6 +4,22 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.1] - 2026-07-11
+
+### Added — East Asian Ambiguous width support
+- 曖昧幅文字（①、○、→、─、※ など）を使っても表がずれなくなりました。
+  起動時に代替スクリーン上へ「○」を出力してカーソル位置を問い合わせ、
+  ターミナルが曖昧幅文字を 1 セル / 2 セルどちらで描画するかを自動判定します。
+- 環境変数 `TBLA_AMBIGUOUS_WIDE=1` / `0` で自動判定を上書きできます。
+- 幅計算を `src/width.rs` に一元化し、グリッド・メニュー・ダイアログ・
+  シートタブ・列幅自動調整のすべてが同じ答えを使うようにしました。
+  セル溢れ表示の「…」も曖昧幅として正しく数えます。
+
+### Added — Series-fill paste (連続貼り付け)
+- コピー元より大きい範囲を選択して貼り付けると、選択範囲全体を
+  Excel 風に埋めます。数値・数値入りテキストの等差系列は増分を
+  引き継いで延長し、数式は参照を調整しながらタイル展開します。
+
 ## [0.4.0] - 2026-07-11
 
 ### Added — Lotus 1-2-3 style operability (inspired by [l123](https://github.com/duane1024/l123))

@@ -6,7 +6,7 @@ use crossterm::{
 };
 use std::cell::Cell;
 use std::io::{stdout, BufWriter, Result, Write};
-use unicode_width::UnicodeWidthStr;
+use crate::width::{char_width, str_width};
 
 use crate::{App, Mode};
 use crate::cell::{Alignment, CellValue, RgbColor};
@@ -131,7 +131,7 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
     let mut result = String::new();
     let mut width = 0;
     for c in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        let w = char_width(c);
         if width + w > max_width {
             break;
         }
@@ -143,7 +143,7 @@ fn truncate_to_width(s: &str, max_width: usize) -> String {
 
 /// Truncate string to fit within max_width - keeps right side (for editing)
 fn truncate_from_end(s: &str, max_width: usize) -> String {
-    let total_width = UnicodeWidthStr::width(s);
+    let total_width = str_width(s);
     if total_width <= max_width {
         return s.to_string();
     }
@@ -153,7 +153,7 @@ fn truncate_from_end(s: &str, max_width: usize) -> String {
     let mut result = String::new();
 
     for c in s.chars() {
-        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(1);
+        let w = char_width(c);
         if skipped < skip_width {
             skipped += w;
         } else {
@@ -165,7 +165,7 @@ fn truncate_from_end(s: &str, max_width: usize) -> String {
 
 /// Pad string to target display width
 fn pad_to_width(s: &str, target_width: usize, align_right: bool) -> String {
-    let current = UnicodeWidthStr::width(s);
+    let current = str_width(s);
     if current >= target_width {
         return truncate_to_width(s, target_width);
     }
@@ -178,7 +178,7 @@ fn pad_to_width(s: &str, target_width: usize, align_right: bool) -> String {
 }
 
 fn center_to_width(s: &str, target_width: usize) -> String {
-    let current = UnicodeWidthStr::width(s);
+    let current = str_width(s);
     if current >= target_width {
         return truncate_to_width(s, target_width);
     }
@@ -189,7 +189,7 @@ fn center_to_width(s: &str, target_width: usize) -> String {
 }
 
 fn display_width(s: &str) -> usize {
-    UnicodeWidthStr::width(s)
+    str_width(s)
 }
 
 /// Visible breakdown of an in-cell edit buffer with a "block" cursor
@@ -206,10 +206,6 @@ impl EditView {
             + char_width(self.cursor_char)
             + display_width(&self.right)
     }
-}
-
-fn char_width(c: char) -> usize {
-    unicode_width::UnicodeWidthChar::width(c).unwrap_or(1)
 }
 
 /// Compute which portion of the edit buffer is visible, given the available
@@ -818,7 +814,12 @@ impl UI {
                         if is_number {
                             "#".repeat(content_width)
                         } else {
-                            let truncated = truncate_to_width(&value, content_width.saturating_sub(1));
+                            // '…' is East Asian Ambiguous: 2 cells wide in
+                            // CJK terminals, 1 elsewhere.
+                            let truncated = truncate_to_width(
+                                &value,
+                                content_width.saturating_sub(char_width('…')),
+                            );
                             format!("{}…", truncated)
                         }
                     } else {
@@ -918,7 +919,7 @@ impl UI {
                 // Truncation marker for overflow.
                 queue!(stdout, SetBackgroundColor(BLACK), SetForegroundColor(DARK_GREY))?;
                 write!(stdout, " …")?;
-                used += 2;
+                used += 1 + char_width('…');
                 break;
             }
             if idx == app.active_sheet_index {

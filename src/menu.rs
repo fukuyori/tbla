@@ -1,4 +1,4 @@
-use unicode_width::UnicodeWidthStr;
+use crate::width::str_width;
 
 /// Actions dispatchable from menus and keyboard shortcuts.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -559,7 +559,7 @@ impl MenuBar {
         let mut positions = Vec::new();
         let mut x: usize = 1; // leading space
         for menu in &self.menus {
-            let width = UnicodeWidthStr::width(menu.label.as_str());
+            let width = str_width(menu.label.as_str());
             positions.push((x, width));
             x += width + 2; // 2-char gap
         }
@@ -596,9 +596,9 @@ impl MenuBar {
         for item in &menu.items {
             if let SubItem::Item { shortcut, .. } = item {
                 let label = item.display_label().unwrap_or_default();
-                let mut w = UnicodeWidthStr::width(label.as_str()) + 4; // padding
+                let mut w = str_width(label.as_str()) + 4; // padding
                 if let Some(s) = shortcut {
-                    w += UnicodeWidthStr::width(*s) + 3;
+                    w += str_width(*s) + 3;
                 }
                 if w > max {
                     max = w;
@@ -766,7 +766,7 @@ impl ContextMenu {
             ("列幅を変更...".to_string(), Action::FormatSetWidth),
         ];
 
-        let width = items.iter().map(|(s, _)| UnicodeWidthStr::width(s.as_str())).max().unwrap_or(20) + 4;
+        let width = items.iter().map(|(s, _)| str_width(s.as_str())).max().unwrap_or(20) + 4;
 
         // Adjust position so the menu fits within terminal
         let mut col = click_col;
