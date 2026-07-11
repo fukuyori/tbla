@@ -172,14 +172,50 @@ range in darker blue).
 | `Ctrl+F` | Find |
 | `F3` | Find next |
 | `Ctrl+R` | Replace (Tab cycles find / replace fields) |
-| `Ctrl+G` | Go to cell |
+| `Ctrl+G` / `F5` | Go to cell or named range |
 
 ### Menu
 
 | Key | Action |
 |-----|--------|
-| `F10` | Open menu bar |
+| `/` | Open the menu bar, Lotus 1-2-3 style (see below) |
+| `F10` | Open menu bar (first menu dropped) |
 | `Alt+F` / `Alt+E` / ... | Open the menu by mnemonic |
+
+**Slash menu (1-2-3 style).** Press `/` in normal mode to enter the menu
+bar (the highlighted menu's dropdown opens as a preview), then descend by
+typing the mnemonic letters shown on each item — no Enter needed: `/D S`
+runs データ → 並べ替え, `/F S` saves. A letter that matches no top-level
+menu runs the matching item of the previewed menu (`/N` = ファイル →
+新規). `Esc` backs out one level at a time; arrow keys still work at
+every level. To type a literal `/` as the first character of a cell,
+start the edit with `F2`.
+
+### Function keys
+
+| Key | Action |
+|-----|--------|
+| `F2` | Edit current cell |
+| `F3` | Find next |
+| `F4` | While editing a formula: cycle the reference under the cursor through `A1` → `$A$1` → `A$1` → `$A1` (ranges cycle both endpoints) |
+| `F5` | Go to a cell address or named range |
+| `F9` | Recalculate (re-rolls volatile functions like RAND / NOW) |
+| `F10` | Open menu bar |
+
+### Named ranges
+
+Define a name for a cell or range via 挿入 → 名前付き範囲を定義
+(`/I N`); the range field is pre-filled from the current selection.
+Names can be used
+
+- in formulas: `=SUM(売上)`, `=税率*B2` (case-insensitive; Japanese OK),
+- as jump targets: `Ctrl+G` / `F5`, then type the name (jumping selects
+  the whole range, switching sheets if needed).
+
+Manage / delete names via 挿入 → 名前付き範囲の管理 (`/I M`). Names are
+saved in `.json` workbooks and round-trip to/from `.xlsx` defined names.
+A name that refers to another sheet resolves in formulas only when it is
+a single cell (engine limitation for cross-sheet ranges).
 
 ## Mouse Operation
 

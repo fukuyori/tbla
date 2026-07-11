@@ -26,6 +26,10 @@ pub enum Action {
     EditFindPrev,
     EditReplace,
     EditGoto,
+    Recalc,
+
+    NameDefine,
+    NameManage,
 
     InsertRow,
     InsertCol,
@@ -84,6 +88,20 @@ pub enum SubItem {
 impl SubItem {
     pub fn is_separator(&self) -> bool {
         matches!(self, SubItem::Separator)
+    }
+
+    /// Label with the mnemonic letter appended, e.g. "保存(S)" /
+    /// "開く(O)..." — the letter drives slash-menu style direct descent,
+    /// so it has to be visible on the item.
+    pub fn display_label(&self) -> Option<String> {
+        let SubItem::Item { label, mnemonic, .. } = self else { return None; };
+        Some(match mnemonic {
+            Some(m) => match label.strip_suffix("...") {
+                Some(stem) => format!("{}({})...", stem, m),
+                None => format!("{}({})", label, m),
+            },
+            None => label.clone(),
+        })
     }
 }
 
@@ -189,7 +207,7 @@ impl MenuBar {
                     },
                     SubItem::Item {
                         label: "やり直し".to_string(),
-                        mnemonic: Some('R'),
+                        mnemonic: Some('Y'),
                         shortcut: Some("Ctrl+Y"),
                         action: Action::EditRedo,
                     },
@@ -246,7 +264,7 @@ impl MenuBar {
                     SubItem::Item {
                         label: "ジャンプ...".to_string(),
                         mnemonic: Some('G'),
-                        shortcut: Some("Ctrl+G"),
+                        shortcut: Some("Ctrl+G/F5"),
                         action: Action::EditGoto,
                     },
                 ],
@@ -279,6 +297,19 @@ impl MenuBar {
                         mnemonic: Some('E'),
                         shortcut: None,
                         action: Action::DeleteCol,
+                    },
+                    SubItem::Separator,
+                    SubItem::Item {
+                        label: "名前付き範囲を定義...".to_string(),
+                        mnemonic: Some('N'),
+                        shortcut: None,
+                        action: Action::NameDefine,
+                    },
+                    SubItem::Item {
+                        label: "名前付き範囲の管理...".to_string(),
+                        mnemonic: Some('M'),
+                        shortcut: None,
+                        action: Action::NameManage,
                     },
                 ],
             },
@@ -391,6 +422,13 @@ impl MenuBar {
                         mnemonic: Some('L'),
                         shortcut: None,
                         action: Action::DataFromSql,
+                    },
+                    SubItem::Separator,
+                    SubItem::Item {
+                        label: "再計算".to_string(),
+                        mnemonic: Some('R'),
+                        shortcut: Some("F9"),
+                        action: Action::Recalc,
                     },
                 ],
             },
@@ -556,7 +594,8 @@ impl MenuBar {
         let menu = &self.menus[menu_idx];
         let mut max = 0;
         for item in &menu.items {
-            if let SubItem::Item { label, shortcut, .. } = item {
+            if let SubItem::Item { shortcut, .. } = item {
+                let label = item.display_label().unwrap_or_default();
                 let mut w = UnicodeWidthStr::width(label.as_str()) + 4; // padding
                 if let Some(s) = shortcut {
                     w += UnicodeWidthStr::width(*s) + 3;
@@ -574,22 +613,36 @@ impl MenuBar {
 pub struct MenuState {
     pub open: Option<usize>,    // open top-level menu index
     pub item: usize,            // highlighted submenu item index
+    /// Whether the submenu dropdown is shown. `false` = bar navigation
+    /// (slash-menu style: a top-level menu is highlighted but not opened;
+    /// its mnemonic letter or Enter/Down opens it).
+    pub dropped: bool,
 }
 
 impl MenuState {
     pub fn close(&mut self) {
         self.open = None;
         self.item = 0;
+        self.dropped = false;
     }
 
     pub fn open_first(&mut self) {
         self.open = Some(0);
         self.item = 0;
+        self.dropped = true;
+    }
+
+    /// Enter bar navigation without dropping a submenu (the `/` key).
+    pub fn open_bar(&mut self) {
+        self.open = Some(0);
+        self.item = 0;
+        self.dropped = false;
     }
 
     pub fn open_index(&mut self, idx: usize) {
         self.open = Some(idx);
         self.item = 0;
+        self.dropped = true;
     }
 
     pub fn move_left(&mut self, bar: &MenuBar) {

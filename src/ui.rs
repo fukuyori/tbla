@@ -474,7 +474,9 @@ impl UI {
 
         for (i, item) in menu.items.iter().enumerate() {
             queue!(stdout, MoveTo(x_start as u16, (i + 1) as u16))?;
-            let is_sel = i == state.item && !item.is_separator();
+            // In bar navigation (slash menu, not yet descended) the dropdown
+            // is a preview: no item is highlighted until the menu is entered.
+            let is_sel = state.dropped && i == state.item && !item.is_separator();
             if is_sel {
                 queue!(stdout, SetBackgroundColor(MENU_SEL_BG), SetForegroundColor(MENU_SEL_FG))?;
             } else {
@@ -485,8 +487,9 @@ impl UI {
                     let line = "─".repeat(width.saturating_sub(2));
                     write!(stdout, " {} ", line)?;
                 }
-                SubItem::Item { label, shortcut, .. } => {
-                    let label_w = display_width(label);
+                SubItem::Item { shortcut, .. } => {
+                    let label = item.display_label().unwrap_or_default();
+                    let label_w = display_width(&label);
                     let inner = width.saturating_sub(2);
                     let line = if let Some(sc) = shortcut {
                         let sc_w = display_width(sc);

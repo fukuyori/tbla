@@ -11,19 +11,32 @@ pub struct Engine<'a> {
     /// When present, references like `Sheet2!A1` resolve against this map;
     /// when absent, cross-sheet references return `#REF!`.
     other_sheets: Option<&'a [(String, &'a HashMap<(usize, usize), Cell>)]>,
+    /// Named ranges: UPPERCASE name → reference text ("A1:B2" / "Sheet2!A1").
+    /// A bare identifier that fails to parse as a cell reference is looked up
+    /// here before reporting #NAME?.
+    names: Option<&'a HashMap<String, String>>,
     eval_stack: HashSet<(usize, usize)>,
 }
 
 impl<'a> Engine<'a> {
     pub fn new(cells: &'a HashMap<(usize, usize), Cell>) -> Self {
-        Engine { cells, other_sheets: None, eval_stack: HashSet::new() }
+        Engine { cells, other_sheets: None, names: None, eval_stack: HashSet::new() }
     }
 
     pub fn with_workbook(
         cells: &'a HashMap<(usize, usize), Cell>,
         other_sheets: &'a [(String, &'a HashMap<(usize, usize), Cell>)],
     ) -> Self {
-        Engine { cells, other_sheets: Some(other_sheets), eval_stack: HashSet::new() }
+        Engine { cells, other_sheets: Some(other_sheets), names: None, eval_stack: HashSet::new() }
+    }
+
+    pub fn set_names(&mut self, names: &'a HashMap<String, String>) {
+        self.names = Some(names);
+    }
+
+    /// Resolve a bare token against the named-range table (case-insensitive).
+    fn resolve_name(&self, token: &str) -> Option<String> {
+        self.names?.get(&token.trim().to_uppercase()).cloned()
     }
 
     pub fn evaluate_formula(&mut self, formula_str: &str) -> Result<CellValue, String> {
@@ -88,14 +101,14 @@ impl<'a> Engine<'a> {
             if pos > 0 {
                 let left = self.evaluate_expr(&expr[..pos])?;
                 let right = self.evaluate_expr(&expr[pos + 1..])?;
-                let op = expr.chars().nth(pos).unwrap();
+                let op = expr[pos..].chars().next().unwrap();
                 return arithmetic(left, right, op);
             }
         }
         if let Some(pos) = find_operator_rtl(expr, &['*', '/']) {
             let left = self.evaluate_expr(&expr[..pos])?;
             let right = self.evaluate_expr(&expr[pos + 1..])?;
-            let op = expr.chars().nth(pos).unwrap();
+            let op = expr[pos..].chars().next().unwrap();
             return arithmetic(left, right, op);
         }
         if let Some(pos) = find_operator_rtl(expr, &['^']) {
@@ -136,6 +149,14 @@ impl<'a> Engine<'a> {
         }
         if let Some((col, row, _, _)) = formula::parse_cell_ref(expr) {
             return self.evaluate_cell(col, row);
+        }
+        // Named range as a scalar term, e.g. =税率*B2. Multi-cell names have
+        // no scalar value; report #VALUE! instead of picking a cell.
+        if let Some(resolved) = self.resolve_name(expr) {
+            if resolved.contains(':') {
+                return Err("#VALUE!".to_string());
+            }
+            return self.evaluate_expr(&resolved);
         }
         Err("#NAME?".to_string())
     }
@@ -247,6 +268,19 @@ impl<'a> Engine<'a> {
     }
 
     fn parse_range(&self, range_str: &str) -> Result<Vec<(usize, usize)>, String> {
+        // Named range used where a range/cell argument is expected,
+        // e.g. =SUM(売上). Resolves to the stored reference text first.
+        if !range_str.contains(':') && formula::parse_cell_ref(range_str).is_none() {
+            if let Some(resolved) = self.resolve_name(range_str) {
+                // Cross-sheet ranges aren't supported by this parser (and
+                // parse_cell_ref would mis-read "Sheet2!A1"); reject rather
+                // than resolve to the wrong cells.
+                if resolved.contains('!') {
+                    return Err("Invalid range".to_string());
+                }
+                return self.parse_range(&resolved);
+            }
+        }
         let parts: Vec<&str> = range_str.split(':').collect();
         if parts.len() == 2 {
             let (sc, sr, _, _) = formula::parse_cell_ref(parts[0]).ok_or("Invalid range")?;
@@ -269,7 +303,14 @@ impl<'a> Engine<'a> {
                 }
             } else if let Some((col, row, _, _)) = formula::parse_cell_ref(&arg) {
                 if let Ok(CellValue::Number(n)) = self.evaluate_cell(col, row) { values.push(n); }
-            } else if let Ok(n) = arg.parse::<f64>() { values.push(n); }
+            } else if let Ok(n) = arg.parse::<f64>() {
+                values.push(n);
+            } else if self.resolve_name(&arg).is_some() {
+                // Named range in a numeric argument list, e.g. =SUM(売上, 10).
+                for (col, row) in self.parse_range(&arg)? {
+                    if let Ok(CellValue::Number(n)) = self.evaluate_cell(col, row) { values.push(n); }
+                }
+            }
         }
         Ok(values)
     }
@@ -1283,20 +1324,20 @@ fn cell_lte(a: &CellValue, b: &CellValue) -> bool {
     }
 }
 
+// The find_* helpers all return BYTE offsets into `expr` so the callers can
+// slice directly; positions must never be treated as char counts (formulas
+// can contain multibyte text in string literals and named ranges).
+
 fn find_operator(expr: &str, op: &str) -> Option<usize> {
     let mut depth = 0;
     let mut in_string = false;
-    let chars: Vec<char> = expr.chars().collect();
-    let op_chars: Vec<char> = op.chars().collect();
-    for i in 0..chars.len() {
-        if chars[i] == '"' { in_string = !in_string; }
+    for (i, c) in expr.char_indices() {
+        if c == '"' { in_string = !in_string; }
         else if !in_string {
-            if chars[i] == '(' { depth += 1; }
-            else if chars[i] == ')' { depth -= 1; }
-            else if depth == 0 && i + op_chars.len() <= chars.len() {
-                if chars[i..i + op_chars.len()].iter().zip(op_chars.iter()).all(|(a, b)| a == b) {
-                    return Some(i);
-                }
+            if c == '(' { depth += 1; }
+            else if c == ')' { depth -= 1; }
+            else if depth == 0 && expr[i..].starts_with(op) {
+                return Some(i);
             }
         }
     }
@@ -1306,15 +1347,16 @@ fn find_operator(expr: &str, op: &str) -> Option<usize> {
 fn find_operator_rtl(expr: &str, ops: &[char]) -> Option<usize> {
     let mut depth = 0;
     let mut in_string = false;
-    let chars: Vec<char> = expr.chars().collect();
-    for i in (0..chars.len()).rev() {
-        if chars[i] == '"' { in_string = !in_string; }
+    let indexed: Vec<(usize, char)> = expr.char_indices().collect();
+    for k in (0..indexed.len()).rev() {
+        let (i, c) = indexed[k];
+        if c == '"' { in_string = !in_string; }
         else if !in_string {
-            if chars[i] == ')' { depth += 1; }
-            else if chars[i] == '(' { depth -= 1; }
-            else if depth == 0 && ops.contains(&chars[i]) {
-                if (chars[i] == '+' || chars[i] == '-') && i > 0 && chars[i - 1].to_ascii_uppercase() == 'E' { continue; }
-                if chars[i] == '-' && i == 0 { continue; }
+            if c == ')' { depth += 1; }
+            else if c == '(' { depth -= 1; }
+            else if depth == 0 && ops.contains(&c) {
+                if (c == '+' || c == '-') && k > 0 && indexed[k - 1].1.to_ascii_uppercase() == 'E' { continue; }
+                if c == '-' && k == 0 { continue; }
                 return Some(i);
             }
         }
@@ -1324,7 +1366,8 @@ fn find_operator_rtl(expr: &str, ops: &[char]) -> Option<usize> {
 
 fn find_matching_paren(expr: &str, start: usize) -> Option<usize> {
     let mut depth = 0;
-    for (i, c) in expr.chars().enumerate().skip(start) {
+    for (i, c) in expr.char_indices() {
+        if i < start { continue; }
         if c == '(' { depth += 1; }
         else if c == ')' { depth -= 1; if depth == 0 { return Some(i); } }
     }
@@ -1453,6 +1496,32 @@ mod tests {
 
     fn n(v: CellValue) -> f64 {
         if let CellValue::Number(x) = v { x } else { panic!("expected number, got {:?}", v) }
+    }
+
+    #[test]
+    fn named_range_in_aggregate_and_scalar() {
+        let m = cells_from(&[(0, 0, "10"), (0, 1, "20"), (0, 2, "30"), (2, 0, "0.1")]);
+        let mut names = HashMap::new();
+        names.insert("売上".to_string(), "A1:A3".to_string());
+        names.insert("税率".to_string(), "C1".to_string());
+
+        let mut e = Engine::new(&m);
+        e.set_names(&names);
+        assert!((n(e.evaluate_formula("=SUM(売上)").unwrap()) - 60.0).abs() < 1e-9);
+
+        let mut e = Engine::new(&m);
+        e.set_names(&names);
+        assert!((n(e.evaluate_formula("=税率*100").unwrap()) - 10.0).abs() < 1e-9);
+
+        // Multi-cell name in scalar position has no value.
+        let mut e = Engine::new(&m);
+        e.set_names(&names);
+        assert!(e.evaluate_formula("=売上+1").is_err());
+
+        // Unknown identifier still reports #NAME?.
+        let mut e = Engine::new(&m);
+        e.set_names(&names);
+        assert_eq!(e.evaluate_formula("=利益"), Err("#NAME?".to_string()));
     }
 
     #[test]

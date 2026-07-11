@@ -15,6 +15,18 @@ struct TblaWorkbookFile {
     #[serde(default)]
     active: usize,
     sheets: Vec<TblaSheetFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    names: Vec<NamedRangeData>,
+}
+
+/// Persisted form of a workbook-level named range.
+#[derive(Serialize, Deserialize)]
+struct NamedRangeData {
+    name: String,
+    sheet: String,
+    /// (col, row), 0-indexed, inclusive.
+    start: (usize, usize),
+    end: (usize, usize),
 }
 
 #[derive(Serialize, Deserialize)]
@@ -570,7 +582,7 @@ fn save_file(app: &App, filename: &str) -> Result<String, String> {
             // position) so multi-sheet workbooks round-trip.
             let sheets: Vec<crate::sheet::Sheet> = app.workbook_sheets()
                 .iter().map(|&s| s.clone()).collect();
-            crate::xlsx::write_xlsx_sheets(&sheets, &filename)?;
+            crate::xlsx::write_xlsx_sheets(&sheets, &app.named_ranges, &filename)?;
             Ok(filename)
         }
         "parquet" => {
@@ -617,6 +629,8 @@ fn load_file(app: &mut App, filename: &str) -> Result<(), String> {
             app.view_col = 0; app.view_row = 0;
             app.selection_anchor = None;
             app.hidden_rows.clear();
+            app.named_ranges = result.names;
+            app.sync_named_ranges();
             if let Some(w) = result.warning { app.status_message = w; }
             Ok(())
         }
@@ -676,10 +690,17 @@ fn save_json(app: &App, filename: &str) -> std::io::Result<()> {
     };
 
     let sheets: Vec<TblaSheetFile> = app.workbook_sheets().iter().map(|s| serialize_sheet(s)).collect();
+    let names = app.named_ranges.iter().map(|nr| NamedRangeData {
+        name: nr.name.clone(),
+        sheet: nr.sheet.clone(),
+        start: nr.start,
+        end: nr.end,
+    }).collect();
     let file_data = TblaWorkbookFile {
         version: "2.0".to_string(),
         active: app.active_sheet_index,
         sheets,
+        names,
     };
     let json = serde_json::to_string_pretty(&file_data)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -707,6 +728,7 @@ fn load_json(app: &mut App, filename: &str) -> std::io::Result<()> {
                     cells: legacy.cells,
                     conditional_formats: Vec::new(),
                 }],
+                names: Vec::new(),
             }
         }
     };
@@ -736,6 +758,7 @@ fn load_json(app: &mut App, filename: &str) -> std::io::Result<()> {
     }
 
     app.save_undo();
+    let names = workbook.names;
     let mut sheets: Vec<crate::sheet::Sheet> = workbook.sheets.into_iter().map(build_sheet).collect();
     let active = workbook.active.min(sheets.len().saturating_sub(1));
     let active_sheet = sheets.remove(active);
@@ -748,6 +771,13 @@ fn load_json(app: &mut App, filename: &str) -> std::io::Result<()> {
     app.view_row = 0;
     app.selection_anchor = None;
     app.hidden_rows.clear();
+    app.named_ranges = names.into_iter().map(|n| crate::NamedRange {
+        name: n.name,
+        sheet: n.sheet,
+        start: n.start,
+        end: n.end,
+    }).collect();
+    app.sync_named_ranges();
     Ok(())
 }
 

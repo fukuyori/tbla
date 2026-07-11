@@ -1,6 +1,6 @@
 [package]
 name = "tbla"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 description = """
 tbla is a terminal spreadsheet editor with standard keyboard and mouse

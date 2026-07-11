@@ -10,6 +10,9 @@ use crate::sheet::{CondCondition, CondOp, ConditionalFormat as CondFmt, Sheet};
 pub struct ReadResult {
     pub sheets: Vec<Sheet>,
     pub warning: Option<String>,
+    /// Workbook-level defined names that map to a simple cell/range
+    /// reference. Complex defined names (multi-area, formulas) are skipped.
+    pub names: Vec<crate::NamedRange>,
 }
 
 /// Read an .xlsx file. ALL sheets are loaded in workbook order. Formulas
@@ -87,22 +90,82 @@ pub fn read_xlsx<P: AsRef<Path>>(path: P) -> Result<ReadResult, String> {
         sheets.push(sheet);
     }
 
-    Ok(ReadResult { sheets, warning: None })
+    let names = workbook
+        .defined_names()
+        .iter()
+        .filter(|(n, _)| !n.starts_with("_xlnm")) // built-ins like Print_Area
+        .filter_map(|(n, f)| parse_defined_name(n, f))
+        .collect();
+
+    Ok(ReadResult { sheets, warning: None, names })
+}
+
+/// Parse an xlsx defined-name target like `Sheet1!$A$1:$B$2` or
+/// `'My Sheet'!$A$1` into a NamedRange. Returns None for anything more
+/// complex (multi-area lists, constants, formulas).
+fn parse_defined_name(name: &str, formula: &str) -> Option<crate::NamedRange> {
+    let f = formula.trim().trim_start_matches('=');
+    if f.contains(',') {
+        return None;
+    }
+    let bang = f.rfind('!')?;
+    let sheet = f[..bang].trim().trim_matches('\'').to_string();
+    let refs = &f[bang + 1..];
+    let parts: Vec<&str> = refs.split(':').collect();
+    let (start, end) = match parts.as_slice() {
+        [one] => {
+            let (c, r, _, _) = crate::formula::parse_cell_ref(one)?;
+            ((c, r), (c, r))
+        }
+        [a, b] => {
+            let (c1, r1, _, _) = crate::formula::parse_cell_ref(a)?;
+            let (c2, r2, _, _) = crate::formula::parse_cell_ref(b)?;
+            ((c1.min(c2), r1.min(r2)), (c1.max(c2), r1.max(r2)))
+        }
+        _ => return None,
+    };
+    Some(crate::NamedRange { name: name.to_string(), sheet, start, end })
 }
 
 /// Write a single `Sheet` to an .xlsx file. Convenience wrapper around
 /// `write_xlsx_sheets` for the single-sheet case (used by tests).
 #[allow(dead_code)]
 pub fn write_xlsx<P: AsRef<Path>>(sheet: &Sheet, path: P) -> Result<(), String> {
-    write_xlsx_sheets(std::slice::from_ref(sheet), path)
+    write_xlsx_sheets(std::slice::from_ref(sheet), &[], path)
 }
 
 /// Write every sheet in `sheets` to an .xlsx file in the given order.
 /// Formulas are written as Excel formulas (so the file recomputes when
 /// opened) and tbla's last evaluated value is written as the cached result.
-/// Column widths are preserved.
-pub fn write_xlsx_sheets<P: AsRef<Path>>(sheets: &[Sheet], path: P) -> Result<(), String> {
+/// Column widths are preserved. `names` become workbook-level defined names.
+pub fn write_xlsx_sheets<P: AsRef<Path>>(
+    sheets: &[Sheet],
+    names: &[crate::NamedRange],
+    path: P,
+) -> Result<(), String> {
     let mut workbook = Workbook::new();
+    for nr in names {
+        let quoted_sheet = if nr.sheet.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            nr.sheet.clone()
+        } else {
+            format!("'{}'", nr.sheet)
+        };
+        let abs = |c: usize, r: usize| {
+            format!("${}${}", crate::formula::col_to_name(c), r + 1)
+        };
+        let target = if nr.start == nr.end {
+            format!("={}!{}", quoted_sheet, abs(nr.start.0, nr.start.1))
+        } else {
+            format!(
+                "={}!{}:{}",
+                quoted_sheet,
+                abs(nr.start.0, nr.start.1),
+                abs(nr.end.0, nr.end.1),
+            )
+        };
+        // Best effort — an invalid name must not fail the whole save.
+        let _ = workbook.define_name(&nr.name, &target);
+    }
     for sheet in sheets {
         let ws = workbook.add_worksheet();
         ws.set_name(&sheet.name)

@@ -74,6 +74,10 @@ pub enum DialogKind {
     FromUrlPickTable,
     /// "データ → SQL から取り込み..." dialog. Fields: URI, query, destination.
     FromSql,
+    /// 挿入 → 名前付き範囲を定義: fields are name and range text.
+    NameDefine,
+    /// 挿入 → 名前付き範囲の管理: shows the list, deletes the typed name.
+    NameManage,
 }
 
 #[derive(Clone, Debug)]
@@ -180,6 +184,20 @@ pub struct App {
     pub last_sql_uri: String,
     /// Last SQL query (session-only).
     pub last_sql_query: String,
+    /// Workbook-level named ranges (source of truth). Each sheet carries a
+    /// derived, sheet-relative resolution map (`Sheet::names`) kept in sync
+    /// via `sync_named_ranges`.
+    pub named_ranges: Vec<NamedRange>,
+}
+
+/// A named range: `name` refers to the inclusive rectangle `start..=end`
+/// on the sheet called `sheet`. Names are unique case-insensitively.
+#[derive(Clone, Debug)]
+pub struct NamedRange {
+    pub name: String,
+    pub sheet: String,
+    pub start: (usize, usize), // (col, row)
+    pub end: (usize, usize),
 }
 
 /// Point mode (Excel-style formula reference selection).
@@ -241,6 +259,7 @@ impl App {
             pending_url_source: String::new(),
             last_sql_uri: String::new(),
             last_sql_query: String::new(),
+            named_ranges: Vec::new(),
         }
     }
 
@@ -329,6 +348,7 @@ impl App {
         self.selection_anchor = None;
         self.cursor_col = 0; self.cursor_row = 0;
         self.view_col = 0; self.view_row = 0;
+        self.sync_named_ranges();
         n
     }
 
@@ -336,6 +356,7 @@ impl App {
     /// (workbook must always have at least one sheet).
     pub fn delete_active_sheet(&mut self) -> bool {
         if self.sheet_count() <= 1 { return false; }
+        let deleted_name = self.sheet.name.clone();
         // Take the next sheet (or previous if active is last) as new active.
         let new_active_index = if self.active_sheet_index < self.other_sheets.len() {
             self.active_sheet_index
@@ -349,6 +370,9 @@ impl App {
         self.selection_anchor = None;
         self.cursor_col = 0; self.cursor_row = 0;
         self.view_col = 0; self.view_row = 0;
+        // Named ranges on the deleted sheet have nothing to refer to anymore.
+        self.named_ranges.retain(|nr| nr.sheet != deleted_name);
+        self.sync_named_ranges();
         true
     }
 
@@ -361,8 +385,150 @@ impl App {
         for s in &self.other_sheets {
             if s.name.to_lowercase() == lower { return false; }
         }
-        self.sheet.name = new_name.to_string();
+        let old_name = std::mem::replace(&mut self.sheet.name, new_name.to_string());
+        // Follow the rename in named-range definitions.
+        for nr in &mut self.named_ranges {
+            if nr.sheet == old_name {
+                nr.sheet = self.sheet.name.clone();
+            }
+        }
+        self.sync_named_ranges();
         true
+    }
+
+    /// Look up a named range case-insensitively.
+    pub fn find_named_range(&self, name: &str) -> Option<&NamedRange> {
+        let upper = name.trim().to_uppercase();
+        self.named_ranges.iter().find(|nr| nr.name.to_uppercase() == upper)
+    }
+
+    /// Recompute every sheet's `names` resolution map from the workbook-level
+    /// definitions. Cheap; call after any change to `named_ranges`, sheet
+    /// renames/deletes, and file load.
+    pub fn sync_named_ranges(&mut self) {
+        fn resolved_for(nr: &NamedRange, sheet_name: &str) -> Option<String> {
+            let single = nr.start == nr.end;
+            if nr.sheet == sheet_name {
+                Some(if single {
+                    crate::formula::cell_name(nr.start.0, nr.start.1)
+                } else {
+                    format!(
+                        "{}:{}",
+                        crate::formula::cell_name(nr.start.0, nr.start.1),
+                        crate::formula::cell_name(nr.end.0, nr.end.1),
+                    )
+                })
+            } else if single {
+                // Cross-sheet single cell rides the existing `Sheet!A1` path.
+                Some(format!(
+                    "{}!{}",
+                    nr.sheet,
+                    crate::formula::cell_name(nr.start.0, nr.start.1)
+                ))
+            } else {
+                // Cross-sheet ranges are unsupported by the engine; leaving
+                // the name unresolved yields an honest #NAME? instead of a
+                // wrong-cell result.
+                None
+            }
+        }
+        let ranges = self.named_ranges.clone();
+        let sync_one = |sheet: &mut Sheet| {
+            sheet.names.clear();
+            for nr in &ranges {
+                if let Some(text) = resolved_for(nr, &sheet.name) {
+                    sheet.names.insert(nr.name.to_uppercase(), text);
+                }
+            }
+        };
+        sync_one(&mut self.sheet);
+        for s in &mut self.other_sheets {
+            sync_one(s);
+        }
+    }
+
+    /// Validate and store a named range on the active sheet, replacing any
+    /// existing definition with the same (case-insensitive) name.
+    /// Returns the normalized range text on success.
+    pub fn define_named_range(
+        &mut self,
+        name: &str,
+        range_text: &str,
+    ) -> std::result::Result<String, String> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("名前を入力してください".to_string());
+        }
+        if name.chars().next().map_or(false, |c| c.is_ascii_digit()) {
+            return Err("名前は数字で始められません".to_string());
+        }
+        if !name.chars().all(|c| c.is_alphanumeric() || c == '_') {
+            return Err("名前に使えるのは英数字・日本語・_ のみです".to_string());
+        }
+        // Anything the reference parser would read as a cell address (A1,
+        // XFD10, ABC_12 → ABC12, ...) can never be reached as a name inside
+        // a formula, so refuse it outright.
+        if crate::formula::parse_cell_ref(name).is_some() {
+            return Err("セル参照と紛らわしい名前は使えません".to_string());
+        }
+
+        let parts: Vec<&str> = range_text.trim().split(':').collect();
+        let (start, end) = match parts.as_slice() {
+            [one] => {
+                let (c, r, _, _) = crate::formula::parse_cell_ref(one)
+                    .ok_or_else(|| format!("無効な範囲: {}", range_text))?;
+                ((c, r), (c, r))
+            }
+            [a, b] => {
+                let (c1, r1, _, _) = crate::formula::parse_cell_ref(a)
+                    .ok_or_else(|| format!("無効な範囲: {}", range_text))?;
+                let (c2, r2, _, _) = crate::formula::parse_cell_ref(b)
+                    .ok_or_else(|| format!("無効な範囲: {}", range_text))?;
+                ((c1.min(c2), r1.min(r2)), (c1.max(c2), r1.max(r2)))
+            }
+            _ => return Err(format!("無効な範囲: {}", range_text)),
+        };
+
+        let upper = name.to_uppercase();
+        self.named_ranges.retain(|nr| nr.name.to_uppercase() != upper);
+        let sheet = self.sheet.name.clone();
+        self.named_ranges.push(NamedRange {
+            name: name.to_string(),
+            sheet,
+            start,
+            end,
+        });
+        self.sync_named_ranges();
+        Ok(if start == end {
+            crate::formula::cell_name(start.0, start.1)
+        } else {
+            format!(
+                "{}:{}",
+                crate::formula::cell_name(start.0, start.1),
+                crate::formula::cell_name(end.0, end.1),
+            )
+        })
+    }
+
+    /// Delete a named range (case-insensitive). Returns true if one existed.
+    pub fn delete_named_range(&mut self, name: &str) -> bool {
+        let upper = name.trim().to_uppercase();
+        let before = self.named_ranges.len();
+        self.named_ranges.retain(|nr| nr.name.to_uppercase() != upper);
+        let removed = self.named_ranges.len() != before;
+        if removed {
+            self.sync_named_ranges();
+        }
+        removed
+    }
+
+    /// One-line summary of the defined names for status/dialog display.
+    pub fn named_range_summary(&self) -> String {
+        self.named_ranges
+            .iter()
+            .map(|nr| nr.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 
     pub fn save_undo(&mut self) {
@@ -927,6 +1093,48 @@ impl App {
         self.point_mode = None;
     }
 
+    /// F4 while editing a formula: cycle the `$` anchoring of the cell
+    /// reference at (or just before) the text cursor, Excel/1-2-3 style:
+    /// A1 → $A$1 → A$1 → $A1 → A1. Ranges cycle both endpoints together.
+    pub fn cycle_ref_absolute(&mut self) {
+        let chars: Vec<char> = self.input_buffer.chars().collect();
+        if chars.first() != Some(&'=') {
+            return;
+        }
+        let is_ref_char = |c: char| c.is_ascii_alphanumeric() || c == '$' || c == ':';
+        let pos = self.edit_cursor_pos.min(chars.len());
+        let mut start = pos;
+        while start > 0 && is_ref_char(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = pos;
+        while end < chars.len() && is_ref_char(chars[end]) {
+            end += 1;
+        }
+        if start == end {
+            return;
+        }
+        let token: String = chars[start..end].iter().collect();
+        let Some(cycled) = cycle_ref_token(&token) else { return; };
+        let cycled_chars = cycled.chars().count();
+
+        let byte_start = self.input_byte_offset(start);
+        let byte_end = self.input_byte_offset(end);
+        self.input_buffer.replace_range(byte_start..byte_end, &cycled);
+        self.edit_cursor_pos = start + cycled_chars;
+
+        // Keep point mode consistent: if the cycled token is exactly the
+        // reference point mode inserted, track its new length; otherwise the
+        // buffer no longer matches what point mode believes it inserted.
+        if let Some(pm) = self.point_mode.as_mut() {
+            if pm.insert_pos == start {
+                pm.inserted_chars = cycled_chars;
+            } else {
+                self.point_mode = None;
+            }
+        }
+    }
+
     /// Scroll the view so the current point-mode cursor is visible.
     fn adjust_view_for_point(&mut self) {
         if let Some(pm) = self.point_mode.clone() {
@@ -1111,8 +1319,47 @@ impl App {
                 self.mode = Mode::Dialog;
             }
             Action::EditGoto => {
-                self.dialog = Some(Dialog::single(DialogKind::Goto, "ジャンプ先セル (例: A1)", ""));
+                self.dialog = Some(Dialog::single(
+                    DialogKind::Goto,
+                    "ジャンプ先 (セル例: A1 / 名前付き範囲)",
+                    "",
+                ));
                 self.mode = Mode::Dialog;
+            }
+            Action::Recalc => {
+                // Formulas are re-evaluated on every redraw, so an explicit
+                // recalc only needs to trigger a frame; it also re-rolls
+                // volatile functions (RAND / NOW / TODAY).
+                self.status_message = "再計算しました".to_string();
+            }
+            Action::NameDefine => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                let range_text = if (min_c, min_r) == (max_c, max_r) {
+                    crate::formula::cell_name(min_c, min_r)
+                } else {
+                    format!(
+                        "{}:{}",
+                        crate::formula::cell_name(min_c, min_r),
+                        crate::formula::cell_name(max_c, max_r),
+                    )
+                };
+                self.dialog = Some(Dialog::multi(DialogKind::NameDefine, vec![
+                    DialogField { label: "名前 (数式・ジャンプで使用)".into(), input: String::new() },
+                    DialogField { label: "範囲 (例: A1:B5)".into(), input: range_text },
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::NameManage => {
+                if self.named_ranges.is_empty() {
+                    self.status_message = "名前付き範囲はありません".to_string();
+                } else {
+                    let label = format!(
+                        "削除する名前 (定義済み: {})",
+                        self.named_range_summary()
+                    );
+                    self.dialog = Some(Dialog::single(DialogKind::NameManage, label, ""));
+                    self.mode = Mode::Dialog;
+                }
             }
             Action::EditReplace => {
                 self.dialog = Some(Dialog::multi(DialogKind::Replace, vec![
@@ -1441,7 +1688,7 @@ impl App {
                 self.mode = Mode::Dialog;
             }
             Action::HelpKeys => {
-                self.status_message = "矢印=移動 / Tab/Enter=次セル / F2=編集 / Ctrl+C/X/V=コピー切取貼付 / Ctrl+Z=戻 / Ctrl+S=保存 / F10=メニュー".to_string();
+                self.status_message = "矢印=移動 / F2=編集 / Ctrl+C/X/V=コピー切取貼付 / Ctrl+Z=戻 / Ctrl+S=保存 / メニュー=「/」か F10 / F4=$切替 / F5=ジャンプ / F9=再計算".to_string();
             }
             Action::HelpAbout => {
                 self.status_message = format!("tbla {} - ターミナル表計算エディタ", env!("CARGO_PKG_VERSION"));
@@ -1493,6 +1740,25 @@ impl App {
                     self.selection_anchor = None;
                     self.adjust_view();
                     self.status_message = format!("{} に移動", crate::formula::cell_name(col, row));
+                } else if let Some(nr) = self.find_named_range(&input).cloned() {
+                    if nr.sheet != self.sheet.name {
+                        if let Some(idx) = self
+                            .workbook_sheets()
+                            .iter()
+                            .position(|s| s.name == nr.sheet)
+                        {
+                            self.switch_sheet(idx);
+                        }
+                    }
+                    self.cursor_col = nr.start.0;
+                    self.cursor_row = nr.start.1;
+                    self.selection_anchor = if nr.start != nr.end {
+                        Some((nr.end.0, nr.end.1))
+                    } else {
+                        None
+                    };
+                    self.adjust_view();
+                    self.status_message = format!("{} ({}) に移動", nr.name, nr.sheet);
                 } else {
                     self.status_message = "無効なセル参照です".to_string();
                 }
@@ -1910,6 +2176,31 @@ impl App {
                     self.status_message = format!("{} は既に使われています", input);
                 }
             }
+            DialogKind::NameDefine => {
+                let name = dialog.fields.get(0)
+                    .map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let range = dialog.fields.get(1)
+                    .map(|f| f.input.trim().to_string()).unwrap_or_default();
+                match self.define_named_range(&name, &range) {
+                    Ok(normalized) => {
+                        self.status_message =
+                            format!("名前 {} = {} を定義しました", name, normalized);
+                    }
+                    Err(e) => {
+                        self.status_message = e;
+                    }
+                }
+            }
+            DialogKind::NameManage => {
+                if input.is_empty() {
+                    self.status_message =
+                        format!("定義済みの名前: {}", self.named_range_summary());
+                } else if self.delete_named_range(&input) {
+                    self.status_message = format!("名前 {} を削除しました", input);
+                } else {
+                    self.status_message = format!("名前 {} は定義されていません", input);
+                }
+            }
             DialogKind::Replace => {
                 // Replace cares about exact strings (incl. whitespace), so
                 // we read the raw field inputs rather than the trimmed primary.
@@ -2201,6 +2492,98 @@ fn autocomplete_aggregate(
 }
 
 #[cfg(test)]
+mod l123_ops_tests {
+    use super::*;
+
+    #[test]
+    fn f4_cycles_single_ref() {
+        assert_eq!(cycle_ref_token("B2").as_deref(), Some("$B$2"));
+        assert_eq!(cycle_ref_token("$B$2").as_deref(), Some("B$2"));
+        assert_eq!(cycle_ref_token("B$2").as_deref(), Some("$B2"));
+        assert_eq!(cycle_ref_token("$B2").as_deref(), Some("B2"));
+    }
+
+    #[test]
+    fn f4_cycles_range_endpoints_together() {
+        assert_eq!(cycle_ref_token("A1:B5").as_deref(), Some("$A$1:$B$5"));
+        assert_eq!(cycle_ref_token("$A$1:$B$5").as_deref(), Some("A$1:B$5"));
+    }
+
+    #[test]
+    fn f4_rejects_non_refs() {
+        assert_eq!(cycle_ref_token("SUM"), None);
+        assert_eq!(cycle_ref_token(""), None);
+        assert_eq!(cycle_ref_token("A1:B2:C3"), None);
+    }
+
+    #[test]
+    fn cycle_ref_absolute_edits_buffer_at_cursor() {
+        let mut app = App::new();
+        app.input_buffer = "=SUM(A1:B5)".to_string();
+        app.edit_cursor_pos = 10; // just after "B5"
+        app.cycle_ref_absolute();
+        assert_eq!(app.input_buffer, "=SUM($A$1:$B$5)");
+        assert_eq!(app.edit_cursor_pos, 14);
+        // Not a formula → untouched.
+        let mut app = App::new();
+        app.input_buffer = "hello A1".to_string();
+        app.edit_cursor_pos = 8;
+        app.cycle_ref_absolute();
+        assert_eq!(app.input_buffer, "hello A1");
+    }
+
+    #[test]
+    fn define_and_resolve_named_range() {
+        let mut app = App::new();
+        app.sheet.set_cell(0, 0, "10".to_string());
+        app.sheet.set_cell(0, 1, "20".to_string());
+        let normalized = app.define_named_range("売上", "A1:A2").expect("define");
+        assert_eq!(normalized, "A1:A2");
+        app.sheet.set_cell(1, 0, "=SUM(売上)".to_string());
+        assert_eq!(app.sheet.evaluate(1, 0), "30");
+        // Redefine replaces, delete removes.
+        app.define_named_range("売上", "A1").expect("redefine");
+        assert_eq!(app.named_ranges.len(), 1);
+        assert!(app.delete_named_range("売上"));
+        assert!(!app.delete_named_range("売上"));
+        // Scalar use of a deleted name reports #NAME?.
+        app.sheet.set_cell(2, 0, "=売上".to_string());
+        assert_eq!(app.sheet.evaluate(2, 0), "#NAME?");
+    }
+
+    #[test]
+    fn named_range_name_validation() {
+        let mut app = App::new();
+        assert!(app.define_named_range("", "A1").is_err());
+        assert!(app.define_named_range("1abc", "A1").is_err());
+        assert!(app.define_named_range("A1", "B2").is_err()); // looks like a ref
+        assert!(app.define_named_range("a b", "A1").is_err()); // space
+        assert!(app.define_named_range("合計_2024", "A1").is_ok());
+        assert!(app.define_named_range("x", "nope").is_err()); // bad range
+    }
+
+    #[test]
+    fn cross_sheet_single_cell_name_resolves() {
+        let mut app = App::new();
+        app.sheet.set_cell(0, 0, "42".to_string());
+        let mut other = Sheet::new();
+        other.name = "Data".to_string();
+        other.set_cell(0, 0, "7".to_string());
+        app.other_sheets.push(other);
+        // Define a name pointing at Data!A1 by defining it while Data is active.
+        app.named_ranges.push(NamedRange {
+            name: "基準値".to_string(),
+            sheet: "Data".to_string(),
+            start: (0, 0),
+            end: (0, 0),
+        });
+        app.sync_named_ranges();
+        app.sheet.set_cell(1, 0, "=基準値*2".to_string());
+        assert_eq!(app.evaluate(1, 0), "14");
+    }
+}
+
+#[cfg(test)]
 mod autocomplete_tests {
     use super::*;
 
@@ -2304,6 +2687,42 @@ mod autocomplete_tests {
     }
 }
 
+/// Cycle a reference token's `$` anchoring one step:
+/// (rel,rel) → (abs,abs) → (rel row-abs) → (col-abs rel) → (rel,rel).
+/// `token` may be a single ref ("B2") or a range ("B2:C5"); ranges cycle all
+/// endpoints in lockstep based on the first endpoint's current state.
+/// Returns None when the token isn't a cell reference (e.g. a function name).
+fn cycle_ref_token(token: &str) -> Option<String> {
+    let parts: Vec<&str> = token.split(':').collect();
+    if parts.is_empty() || parts.len() > 2 || parts.iter().any(|p| p.is_empty()) {
+        return None;
+    }
+    let mut parsed = Vec::new();
+    for p in &parts {
+        parsed.push(crate::formula::parse_cell_ref(p)?);
+    }
+    let (_, _, col_abs, row_abs) = parsed[0];
+    let (next_col_abs, next_row_abs) = match (col_abs, row_abs) {
+        (false, false) => (true, true),
+        (true, true) => (false, true),
+        (false, true) => (true, false),
+        (true, false) => (false, false),
+    };
+    let rebuilt: Vec<String> = parsed
+        .iter()
+        .map(|(col, row, _, _)| {
+            format!(
+                "{}{}{}{}",
+                if next_col_abs { "$" } else { "" },
+                crate::formula::col_to_name(*col),
+                if next_row_abs { "$" } else { "" },
+                row + 1,
+            )
+        })
+        .collect();
+    Some(rebuilt.join(":"))
+}
+
 fn handle_key(app: &mut App, key: KeyEvent) {
     match app.mode {
         Mode::Normal => handle_normal_mode(app, key),
@@ -2399,6 +2818,12 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
         KeyCode::F(3) => {
             app.dispatch(Action::EditFindNext);
         }
+        KeyCode::F(5) => {
+            app.dispatch(Action::EditGoto);
+        }
+        KeyCode::F(9) => {
+            app.dispatch(Action::Recalc);
+        }
         KeyCode::Left => app.move_cursor(-1, 0, shift),
         KeyCode::Right => app.move_cursor(1, 0, shift),
         KeyCode::Up => app.move_cursor(0, -1, shift),
@@ -2441,8 +2866,19 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
             app.selection_anchor = None;
         }
         KeyCode::Char(c) => {
-            // Any printable char starts edit mode (Excel-style)
             if !ctrl && !alt {
+                // Lotus 1-2-3 style: `/` opens the menu bar for letter-key
+                // navigation instead of starting a cell edit. A literal `/`
+                // as the first character can still be typed via F2.
+                // '／' covers a Japanese IME left on while hitting the key.
+                if c == '/' || c == '／' {
+                    app.menu_state.open_bar();
+                    app.mode = Mode::Menu;
+                    app.status_message =
+                        "メニュー: 頭文字キーで選択 / Esc で戻る".to_string();
+                    return;
+                }
+                // Any printable char starts edit mode (Excel-style)
                 app.begin_edit(Some(c), false);
             }
         }
@@ -2568,6 +3004,9 @@ fn handle_edit_mode(app: &mut App, key: KeyEvent) {
                 app.cancel_edit();
             }
         }
+        KeyCode::F(4) => {
+            app.cycle_ref_absolute();
+        }
         KeyCode::Enter => {
             app.exit_point_mode();
             app.commit_edit();
@@ -2652,10 +3091,43 @@ fn handle_edit_mode(app: &mut App, key: KeyEvent) {
 fn handle_menu_mode(app: &mut App, key: KeyEvent) {
     let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+    // Bar navigation (slash-menu style): a top-level menu is highlighted and
+    // its dropdown shown as a preview (no item selected). A top-level letter
+    // switches + descends; a letter with no top-level match runs the matching
+    // item of the previewed menu. Enter / Down descends into the preview.
+    if !app.menu_state.dropped {
+        match key.code {
+            KeyCode::Esc => {
+                app.menu_state.close();
+                app.mode = Mode::Normal;
+            }
+            KeyCode::Left => app.menu_state.move_left(&app.menu_bar),
+            KeyCode::Right => app.menu_state.move_right(&app.menu_bar),
+            KeyCode::Enter | KeyCode::Down => {
+                app.menu_state.dropped = true;
+            }
+            KeyCode::Char(c) => {
+                // open_index (via activate_by_mnemonic) drops the submenu,
+                // so a single letter descends one level without Enter.
+                if app.menu_bar.activate_by_mnemonic(c, &mut app.menu_state) {
+                    return;
+                }
+                if let Some(action) = app.menu_state.activate_by_mnemonic(&app.menu_bar, c) {
+                    app.menu_state.close();
+                    app.mode = Mode::Normal;
+                    app.dispatch(action);
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
     match key.code {
         KeyCode::Esc => {
-            app.menu_state.close();
-            app.mode = Mode::Normal;
+            // Back out one level: dropdown → bar navigation → (next Esc) close.
+            app.menu_state.dropped = false;
+            app.menu_state.item = 0;
         }
         KeyCode::Left => app.menu_state.move_left(&app.menu_bar),
         KeyCode::Right => app.menu_state.move_right(&app.menu_bar),

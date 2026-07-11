@@ -4,6 +4,37 @@ All notable changes to this project are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/);
 this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.4.0] - 2026-07-11
+
+### Added — Lotus 1-2-3 style operability (inspired by [l123](https://github.com/duane1024/l123))
+- **Slash menu**: `/` (or IME full-width `／`) in normal mode enters the
+  menu bar with the highlighted menu's dropdown shown as a preview.
+  Mnemonic letters (now displayed on every submenu item, e.g. 並べ替え(S))
+  descend without Enter — `/D S` = データ → 並べ替え, `/F S` = 保存; a
+  letter with no top-level match runs the previewed menu's item (`/N` =
+  新規). `Esc` backs out one level at a time. A literal leading `/` in a
+  cell can still be typed via `F2`.
+- **F4 — cycle reference anchoring**: while editing a formula, cycles the
+  reference at the cursor through `A1` → `$A$1` → `A$1` → `$A1`; ranges
+  cycle both endpoints. Works on a reference just inserted by point mode.
+- **F5 — GOTO**: opens the ジャンプ dialog (same as `Ctrl+G`); the dialog
+  now also accepts named ranges (jumps, selects the range, switches sheet).
+- **F9 — recalculate**: forces a redraw / re-rolls volatile functions
+  (`RAND`, `NOW`, ...). Also available as データ → 再計算.
+- **Named ranges**: 挿入 → 名前付き範囲を定義... / 名前付き範囲の管理...
+  (`/I N`, `/I M`). Names (case-insensitive, Japanese OK) usable in
+  formulas (`=SUM(売上)`, `=税率*B2`) and as GOTO targets. Persisted in
+  the `.json` workbook format and round-tripped to/from `.xlsx` defined
+  names. Cross-sheet names resolve in formulas for single cells only.
+
+### Fixed
+- Formula engine operator splitting was byte/char inconsistent and could
+  panic on multibyte text outside string literals (e.g. `=税率*100` with
+  a named range); `find_operator` / `find_operator_rtl` /
+  `find_matching_paren` now return byte offsets.
+- 編集メニューの「やり直し」のニーモニックが「置換」と重複していたのを
+  `Y` に変更。
+
 ## [0.3.3] - 2026-05-22
 
 ### Added — HTML table import from URL

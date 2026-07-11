@@ -85,6 +85,13 @@ pub struct Sheet {
     /// Not serialized: file save / load round-trips through `cells`.
     #[serde(skip)]
     pub df_view: Option<crate::df_view::DataFrameView>,
+    /// Named ranges resolved for THIS sheet: UPPERCASE name → reference text
+    /// that is valid in a formula evaluated on this sheet ("A1:B2", or
+    /// "Sheet2!A1" for a single cell on another sheet). Derived state kept in
+    /// sync from the workbook-level definitions (`App::named_ranges`); the
+    /// definitions themselves are what gets persisted.
+    #[serde(skip)]
+    pub names: HashMap<String, String>,
 }
 
 impl Sheet {
@@ -95,6 +102,7 @@ impl Sheet {
             col_widths: HashMap::new(),
             conditional_formats: Vec::new(),
             df_view: None,
+            names: HashMap::new(),
         }
     }
 
@@ -316,6 +324,9 @@ impl Sheet {
                 } else {
                     Engine::with_workbook(&self.cells, other_sheets)
                 };
+                if !self.names.is_empty() {
+                    engine.set_names(&self.names);
+                }
                 let formatted = |v: CellValue| match v {
                     CellValue::Number(n) => cell.format_number(n),
                     CellValue::Text(s) => s,
