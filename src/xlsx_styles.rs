@@ -8,7 +8,8 @@
 //! - Theme colors and indexed colors resolve to None (we don't load
 //!   `xl/theme/theme1.xml`); only direct `rgb="AARRGGBB"` colors come
 //!   through.
-//! - Italic/underline/borders/etc. are intentionally skipped.
+//! - Borders/strikethrough/theme colors etc. are intentionally skipped
+//!   (bold/italic/underline are parsed).
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -25,6 +26,8 @@ pub struct CellStyle {
     pub bg_color: Option<RgbColor>,
     pub alignment: Alignment,
     pub bold: bool,
+    pub italic: bool,
+    pub underline: bool,
 }
 
 /// Per-sheet map of `(col, row) -> style` parsed from the .xlsx file.
@@ -65,7 +68,8 @@ pub fn read_workbook_styles(path: &str) -> Result<WorkbookStyles, String> {
             .into_iter()
             .filter_map(|((c, r), xf_idx)| cell_xfs.get(xf_idx).cloned().map(|st| ((c, r), st)))
             .filter(|(_, st)| st.font_color.is_some() || st.bg_color.is_some()
-                || !matches!(st.alignment, Alignment::Default) || st.bold)
+                || !matches!(st.alignment, Alignment::Default)
+                || st.bold || st.italic || st.underline)
             .collect();
         sheet_styles.push(resolved);
         sheet_conditionals.push(parse_sheet_conditionals(&sheet_xml, &dxfs));
@@ -106,6 +110,8 @@ fn parse_argb(s: &str) -> Option<RgbColor> {
 struct FontInfo {
     color: Option<RgbColor>,
     bold: bool,
+    italic: bool,
+    underline: bool,
 }
 
 #[derive(Clone, Default, Debug)]
@@ -163,17 +169,24 @@ fn parse_styles(xml: &str) -> Vec<CellStyle> {
                         }
                         if !is_empty { ctx_stack.push(Ctx::FontColor); }
                     }
-                    "b" if matches!(ctx_stack.last(), Some(Ctx::Font)) => {
-                        // <b/> means bold = true. <b val="0"/> means false.
+                    "b" | "i" | "u" if matches!(ctx_stack.last(), Some(Ctx::Font)) => {
+                        // <b/> means on. <b val="0"/> means off. Same rule
+                        // for <i/> (italic) and <u/> (underline; any u val
+                        // other than "none"/off counts as underlined).
                         let mut on = true;
                         for a in e.attributes().flatten() {
                             if a.key.0 == b"val" {
                                 if let Ok(v) = std::str::from_utf8(&a.value) {
-                                    on = v != "0" && v.to_lowercase() != "false";
+                                    let v = v.to_lowercase();
+                                    on = v != "0" && v != "false" && v != "none";
                                 }
                             }
                         }
-                        current_font.bold = on;
+                        match local {
+                            "b" => current_font.bold = on,
+                            "i" => current_font.italic = on,
+                            _ => current_font.underline = on,
+                        }
                     }
                     "fills" => ctx_stack.push(Ctx::Fills),
                     "fill" if matches!(ctx_stack.last(), Some(Ctx::Fills)) => {
@@ -265,6 +278,8 @@ fn parse_styles(xml: &str) -> Vec<CellStyle> {
             if let Some(fi) = xf.font_id.and_then(|i| fonts.get(i)) {
                 st.font_color = fi.color;
                 st.bold = fi.bold;
+                st.italic = fi.italic;
+                st.underline = fi.underline;
             }
         }
         if xf.apply_fill {
@@ -281,6 +296,8 @@ fn parse_styles(xml: &str) -> Vec<CellStyle> {
         if !xf.apply_font {
             if let Some(fi) = xf.font_id.and_then(|i| fonts.get(i)) {
                 if fi.bold { st.bold = true; }
+                if fi.italic { st.italic = true; }
+                if fi.underline { st.underline = true; }
             }
         }
         st

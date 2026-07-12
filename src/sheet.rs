@@ -72,6 +72,10 @@ pub enum CondOp { Gt, Lt, Ge, Le, Eq, Ne }
 fn default_min_color() -> crate::cell::RgbColor { (255, 235, 235) }
 fn default_max_color() -> crate::cell::RgbColor { (220, 50, 50) }
 
+fn is_general(f: &crate::cell::DisplayFormat) -> bool {
+    matches!(f, crate::cell::DisplayFormat::General)
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Sheet {
     pub name: String,
@@ -79,6 +83,11 @@ pub struct Sheet {
     col_widths: HashMap<usize, usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub conditional_formats: Vec<ConditionalFormat>,
+    /// Sheet-wide default number format (l123's `/Worksheet Global Format`).
+    /// Cells whose own format is General inherit this for display; setting
+    /// a cell back to 標準 therefore re-inherits the sheet default.
+    #[serde(default, skip_serializing_if = "is_general")]
+    pub default_format: crate::cell::DisplayFormat,
     /// Session-only Polars DataFrame view. When `Some`, the grid renders
     /// from the DataFrame and ignores `cells` for display. Cells remain
     /// untouched underneath so reverting to cell view is lossless.
@@ -101,8 +110,19 @@ impl Sheet {
             cells: HashMap::new(),
             col_widths: HashMap::new(),
             conditional_formats: Vec::new(),
+            default_format: crate::cell::DisplayFormat::General,
             df_view: None,
             names: HashMap::new(),
+        }
+    }
+
+    /// The format a cell actually renders with: its own format, or the
+    /// sheet default when the cell is (still) General.
+    pub fn effective_format(&self, cell: &Cell) -> crate::cell::DisplayFormat {
+        if matches!(cell.format, crate::cell::DisplayFormat::General) {
+            self.default_format.clone()
+        } else {
+            cell.format.clone()
         }
     }
 
@@ -312,9 +332,10 @@ impl Sheet {
         other_sheets: &[(String, &HashMap<(usize, usize), Cell>)],
     ) -> String {
         let cell = self.get_cell(col, row);
+        let eff = self.effective_format(&cell);
         match &cell.value {
             CellValue::Empty => String::new(),
-            CellValue::Number(n) => cell.format_number(*n),
+            CellValue::Number(n) => crate::cell::format_number_with(*n, &eff, cell.neg_parens),
             CellValue::Text(s) => s.clone(),
             CellValue::Boolean(b) => if *b { "TRUE" } else { "FALSE" }.to_string(),
             CellValue::Error(e) => e.to_string().to_string(),
@@ -328,7 +349,7 @@ impl Sheet {
                     engine.set_names(&self.names);
                 }
                 let formatted = |v: CellValue| match v {
-                    CellValue::Number(n) => cell.format_number(n),
+                    CellValue::Number(n) => crate::cell::format_number_with(n, &eff, cell.neg_parens),
                     CellValue::Text(s) => s,
                     CellValue::Boolean(b) => if b { "TRUE" } else { "FALSE" }.to_string(),
                     CellValue::Error(e) => e.to_string().to_string(),

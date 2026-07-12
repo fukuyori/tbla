@@ -8,7 +8,7 @@ use std::cell::Cell;
 use std::io::{stdout, BufWriter, Result, Write};
 use crate::width::{char_width, str_width};
 
-use crate::{App, Mode};
+use crate::{App, Dialog, Mode};
 use crate::cell::{Alignment, CellValue, RgbColor};
 use crate::formula;
 use crate::menu::{MenuBar, MenuState, SubItem, ContextMenu};
@@ -124,6 +124,8 @@ const MENU_SEL_FG: Color = WHITE;
 const SELECTION_BG: Color = Color::Rgb { r: 60, g: 110, b: 200 };
 // Point mode (Excel-style formula reference selection) highlight
 const POINT_CURSOR_BG: Color = Color::Rgb { r: 80, g: 150, b: 255 };
+/// 負数を赤で表示 (neg_red) foreground.
+const NEG_RED: Color = Color::Rgb { r: 235, g: 80, b: 80 };
 const POINT_RANGE_BG: Color = Color::Rgb { r: 40, g: 80, b: 160 };
 
 /// Truncate string to fit within max_width (display width) - keeps left side
@@ -190,6 +192,43 @@ fn center_to_width(s: &str, target_width: usize) -> String {
 
 fn display_width(s: &str) -> usize {
     str_width(s)
+}
+
+const BTN_OK: &str = "[  OK  ]";
+const BTN_CANCEL: &str = "[ キャンセル ]";
+const BTN_GAP: usize = 3;
+
+/// Result of mouse hit-testing against the dialog box.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum DialogHit {
+    /// A specific option of a choice field: (field index, option index).
+    Option(usize, usize),
+    /// A field row (text field, or a choice row outside any option).
+    Field(usize),
+    Ok,
+    Cancel,
+    /// Inside the box but on nothing interactive.
+    Inside,
+    Outside,
+}
+
+/// Keep the tail of `s` that fits in `width` cells — used for dialog text
+/// inputs so the end being edited stays visible when the input overflows.
+fn tail_to_width(s: &str, width: usize) -> String {
+    if display_width(s) <= width {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for c in s.chars().rev() {
+        let cw = char_width(c);
+        if w + cw > width {
+            break;
+        }
+        out.insert(0, c);
+        w += cw;
+    }
+    out
 }
 
 /// Visible breakdown of an in-cell edit buffer with a "block" cursor
@@ -392,6 +431,11 @@ impl UI {
         if let Some(cm) = &app.context_menu {
             Self::draw_context_menu(&mut stdout, cm)?;
         }
+        if app.mode == Mode::Popup {
+            if let Some(p) = &app.popup {
+                Self::draw_popup(&mut stdout, p)?;
+            }
+        }
         if app.mode == Mode::Dialog {
             Self::draw_dialog(&mut stdout, app, term_height, term_width)?;
         }
@@ -407,16 +451,13 @@ impl UI {
                 set_cursor_visible(&mut stdout, false)?;
             }
         } else if app.mode == Mode::Dialog {
-            // Place the cursor at the end of the focused dialog input.
-            if let Some(dialog) = &app.dialog {
-                let n = dialog.fields.len();
-                let f = &dialog.fields[dialog.focus];
-                // Field i (0-based) renders at term_height - (n + 1 - i) so
-                // field 0 is on top and the bottom (hint) line stays at -1.
-                let line_from_bottom = (n + 1 - dialog.focus) as u16;
-                let prefix = format!(" {}: ", f.label);
-                let x = display_width(&prefix) + display_width(&f.input);
-                queue!(stdout, MoveTo(x as u16, term_height - line_from_bottom))?;
+            // Place the cursor at the end of the focused dialog input so the
+            // IME composition window appears there. Choice fields have no
+            // text input, so no cursor for them.
+            if let Some((cx, cy)) = app.dialog.as_ref()
+                .and_then(|d| Self::dialog_cursor_pos(d, term_width, term_height))
+            {
+                queue!(stdout, MoveTo(cx, cy))?;
                 set_cursor_visible(&mut stdout, true)?;
             } else {
                 set_cursor_visible(&mut stdout, false)?;
@@ -537,43 +578,278 @@ impl UI {
         Ok(())
     }
 
-    fn draw_dialog(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
-        let Some(dialog) = &app.dialog else { return Ok(()); };
+    /// Key-help line shown inside the dialog box, tailored to its fields.
+    fn dialog_hint(dialog: &Dialog) -> String {
+        let mut hint = String::from("Enter: 実行   Esc: キャンセル");
+        if dialog.fields.len() > 1 {
+            hint.push_str("   Tab/↑↓: 項目移動");
+        }
+        if dialog.fields.iter().any(|f| f.is_choice()) {
+            hint.push_str("   ←/→: 選択");
+        }
+        hint
+    }
 
-        // Each field gets its own row above the hint line. Field 0 sits at
-        // the top of the dialog area, last field just above the hint.
+    /// Rendered width of one option of a choice field, including its
+    /// one-cell trailing separator. Kept in one place so drawing and
+    /// mouse hit-testing can't disagree.
+    fn choice_option_width(f: &crate::DialogField, oi: usize) -> usize {
+        let name_w = display_width(&f.options[oi]);
+        match &f.swatches {
+            // "[■名]" (or "[名]" for the no-color entry) + separator.
+            Some(sw) => {
+                let sw_w = if sw[oi].is_some() { display_width("■") } else { 0 };
+                2 + sw_w + name_w + 1
+            }
+            // " 名 " + separator.
+            None => name_w + 3,
+        }
+    }
+
+    /// Geometry of the centered dialog box: (left column, top row, inner
+    /// content width). The box is `inner + 4` cells wide ("│ … │") and
+    /// `fields + 4` rows tall (frame, fields, button row, hint line).
+    fn dialog_layout(dialog: &Dialog, term_width: u16, term_height: u16) -> (u16, u16, usize) {
+        let mut want = display_width(&Self::dialog_hint(dialog));
+        want = want.max(display_width(dialog.kind.title()) + 4);
+        want = want.max(display_width(BTN_OK) + BTN_GAP + display_width(BTN_CANCEL));
+        for f in &dialog.fields {
+            // marker + "label: " + content (+ trailing cursor for text).
+            let w = if f.is_choice() {
+                1 + display_width(&f.label) + 2
+                    + (0..f.options.len()).map(|oi| Self::choice_option_width(f, oi)).sum::<usize>()
+            } else {
+                1 + display_width(&f.label) + 2 + display_width(&f.input) + 1
+            };
+            want = want.max(w);
+        }
+        let inner = want.max(40).min((term_width as usize).saturating_sub(6));
+        let box_w = inner + 4;
+        let box_h = dialog.fields.len() + 4;
+        let x0 = (term_width as usize).saturating_sub(box_w) / 2;
+        // Keep the box below the menu bar (row 0).
+        let y0 = ((term_height as usize).saturating_sub(box_h) / 2).max(1);
+        (x0 as u16, y0 as u16, inner)
+    }
+
+    /// What a mouse position lands on inside (or outside) the dialog box.
+    pub fn dialog_hit_test(dialog: &Dialog, term_width: u16, term_height: u16, x: u16, y: u16) -> DialogHit {
+        let (x0, y0, inner) = Self::dialog_layout(dialog, term_width, term_height);
+        let (x, y) = (x as usize, y as usize);
+        let (x0, y0) = (x0 as usize, y0 as usize);
         let n = dialog.fields.len();
-        let multi = n > 1;
-        for (i, f) in dialog.fields.iter().enumerate() {
-            let line_from_bottom = (n + 1 - i) as u16;
+        if x < x0 || x >= x0 + inner + 4 || y < y0 || y > y0 + n + 3 {
+            return DialogHit::Outside;
+        }
+        // Field rows sit at y0+1 ..= y0+n.
+        if y > y0 && y <= y0 + n {
+            let i = y - y0 - 1;
+            let f = &dialog.fields[i];
+            if f.is_choice() {
+                // "│ " + marker + "label: ", then the options.
+                let mut start = x0 + 2 + 1 + display_width(&f.label) + 2;
+                for oi in 0..f.options.len() {
+                    let w = Self::choice_option_width(f, oi);
+                    if start + w > x0 + 2 + inner {
+                        break; // truncated options aren't drawn → not clickable
+                    }
+                    // Exclude the trailing separator cell.
+                    if x >= start && x < start + w - 1 {
+                        return DialogHit::Option(i, oi);
+                    }
+                    start += w;
+                }
+            }
+            return DialogHit::Field(i);
+        }
+        // Button row sits just below the fields.
+        if y == y0 + n + 1 {
+            let ok_w = display_width(BTN_OK);
+            let ca_w = display_width(BTN_CANCEL);
+            let left = x0 + 2 + inner.saturating_sub(ok_w + BTN_GAP + ca_w) / 2;
+            if x >= left && x < left + ok_w {
+                return DialogHit::Ok;
+            }
+            if x >= left + ok_w + BTN_GAP && x < left + ok_w + BTN_GAP + ca_w {
+                return DialogHit::Cancel;
+            }
+        }
+        DialogHit::Inside
+    }
+
+    /// Row content for a text input field: marker + label + the tail of the
+    /// input that fits (so the end being edited stays visible). Returns the
+    /// full row string; its width is what the OS cursor position is based on.
+    fn dialog_text_row(dialog: &Dialog, i: usize, inner: usize) -> String {
+        let f = &dialog.fields[i];
+        // ASCII ">" marker on purpose: East Asian Ambiguous arrows would
+        // shift the row by one cell in ambiguous-wide terminals.
+        let marker = if dialog.fields.len() > 1 && i == dialog.focus { ">" } else { " " };
+        let prefix = format!("{}{}: ", marker, f.label);
+        let avail = inner.saturating_sub(display_width(&prefix) + 1);
+        format!("{}{}", prefix, tail_to_width(&f.input, avail))
+    }
+
+    /// Where the OS terminal cursor should sit while a dialog is open:
+    /// end of the focused text input. None for choice fields (no text cursor).
+    pub fn dialog_cursor_pos(dialog: &Dialog, term_width: u16, term_height: u16) -> Option<(u16, u16)> {
+        if dialog.fields[dialog.focus].is_choice() {
+            return None;
+        }
+        let (x0, y0, inner) = Self::dialog_layout(dialog, term_width, term_height);
+        let row = Self::dialog_text_row(dialog, dialog.focus, inner);
+        let x = x0 as usize + 2 + display_width(&row);
+        Some((x as u16, y0 + 1 + dialog.focus as u16))
+    }
+
+    /// WYSIWYG (":") popup: draw each open level as a bordered box, deeper
+    /// levels cascading to the right. Only the deepest level's selection is
+    /// "live", but parent selections stay highlighted to show the path.
+    fn draw_popup(stdout: &mut impl Write, popup: &crate::PopupMenu) -> Result<()> {
+        for lvl in &popup.stack {
+            let width = lvl.width;
+            let sw_col = lvl.items.iter().any(|i| i.swatch.is_some());
+            queue!(stdout, MoveTo(lvl.col, lvl.row), SetBackgroundColor(MENU_BG), SetForegroundColor(MENU_FG))?;
+            write!(stdout, "┌{}┐", "─".repeat(width.saturating_sub(2)))?;
+            for (i, item) in lvl.items.iter().enumerate() {
+                queue!(stdout, MoveTo(lvl.col, lvl.row + 1 + i as u16))?;
+                let is_sel = i == lvl.selected;
+                let (bg, fg) = if is_sel { (MENU_SEL_BG, MENU_SEL_FG) } else { (MENU_BG, MENU_FG) };
+                queue!(stdout, SetBackgroundColor(bg), SetForegroundColor(fg))?;
+                write!(stdout, "│")?;
+                if sw_col {
+                    match item.swatch.flatten() {
+                        Some((r, g, b)) => {
+                            queue!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+                            write!(stdout, "■")?;
+                            queue!(stdout, SetForegroundColor(fg))?;
+                            // ■ is East Asian Ambiguous (1 or 2 cells); pad
+                            // with what's left of its reserved 2 columns.
+                            write!(stdout, "{:w$}", "", w = 2usize.saturating_sub(display_width("■")))?;
+                        }
+                        None => write!(stdout, "  ")?,
+                    }
+                }
+                let label = item.display_label();
+                let inner = width.saturating_sub(2 + if sw_col { 2 } else { 0 });
+                write!(stdout, "{}", pad_to_width(&label, inner, false))?;
+                write!(stdout, "│")?;
+            }
             queue!(
                 stdout,
-                MoveTo(0, term_height - line_from_bottom),
+                MoveTo(lvl.col, lvl.row + 1 + lvl.items.len() as u16),
                 SetBackgroundColor(MENU_BG),
                 SetForegroundColor(MENU_FG)
             )?;
-            let cursor = if i == dialog.focus { "_" } else { " " };
-            let trailing = if multi && i == n - 1 {
-                "  (Tab で切替, Enter で実行)"
+            write!(stdout, "└{}┘", "─".repeat(width.saturating_sub(2)))?;
+        }
+        queue!(stdout, ResetColor)?;
+        Ok(())
+    }
+
+    fn draw_dialog(stdout: &mut impl Write, app: &App, term_height: u16, term_width: u16) -> Result<()> {
+        let Some(dialog) = &app.dialog else { return Ok(()); };
+
+        let (x0, y0, inner) = Self::dialog_layout(dialog, term_width, term_height);
+        let box_w = inner + 4;
+        let n = dialog.fields.len();
+
+        // Top border with the dialog title: ┌─ タイトル ─────┐
+        queue!(stdout, MoveTo(x0, y0), SetBackgroundColor(MENU_BG), SetForegroundColor(MENU_FG))?;
+        let title = format!(" {} ", dialog.kind.title());
+        let title = truncate_to_width(&title, box_w.saturating_sub(4));
+        let dashes = box_w.saturating_sub(3 + display_width(&title));
+        write!(stdout, "┌─{}{}┐", title, "─".repeat(dashes))?;
+
+        for (i, f) in dialog.fields.iter().enumerate() {
+            queue!(
+                stdout,
+                MoveTo(x0, y0 + 1 + i as u16),
+                SetBackgroundColor(MENU_BG),
+                SetForegroundColor(MENU_FG)
+            )?;
+            write!(stdout, "│ ")?;
+            if f.is_choice() {
+                // Focused row gets a ">" marker; the selected option is
+                // rendered highlighted: >揃え:  自動  [左揃え]  中央揃え …
+                // Palette options show a colored ■ swatch: [■赤]
+                let marker = if n > 1 && i == dialog.focus { ">" } else { " " };
+                let prefix = truncate_to_width(&format!("{}{}: ", marker, f.label), inner);
+                write!(stdout, "{}", prefix)?;
+                let mut w = display_width(&prefix);
+                for (oi, opt) in f.options.iter().enumerate() {
+                    let seg_w = Self::choice_option_width(f, oi);
+                    if w + seg_w > inner {
+                        break;
+                    }
+                    let selected = oi == f.selected;
+                    if selected {
+                        queue!(stdout, SetBackgroundColor(MENU_SEL_BG), SetForegroundColor(MENU_SEL_FG))?;
+                    }
+                    match f.swatches.as_ref().map(|sw| sw[oi]) {
+                        Some(swatch) => {
+                            write!(stdout, "{}", if selected { "[" } else { " " })?;
+                            if let Some((r, g, b)) = swatch {
+                                queue!(stdout, SetForegroundColor(Color::Rgb { r, g, b }))?;
+                                write!(stdout, "■")?;
+                                queue!(stdout, SetForegroundColor(
+                                    if selected { MENU_SEL_FG } else { MENU_FG }
+                                ))?;
+                            }
+                            write!(stdout, "{}", opt)?;
+                            write!(stdout, "{}", if selected { "]" } else { " " })?;
+                        }
+                        None => {
+                            write!(stdout, " {} ", opt)?;
+                        }
+                    }
+                    if selected {
+                        queue!(stdout, SetBackgroundColor(MENU_BG), SetForegroundColor(MENU_FG))?;
+                    }
+                    write!(stdout, " ")?;
+                    w += seg_w;
+                }
+                write!(stdout, "{:pad$}", "", pad = inner.saturating_sub(w))?;
             } else {
-                ""
-            };
-            let prompt = format!(" {}: {}{}{} ", f.label, f.input, cursor, trailing);
-            let display = pad_to_width(&prompt, term_width as usize, false);
-            write!(stdout, "{}", display)?;
-            queue!(stdout, ResetColor)?;
+                let mut row = Self::dialog_text_row(dialog, i, inner);
+                if i == dialog.focus {
+                    row.push('_');
+                }
+                write!(stdout, "{}", pad_to_width(&row, inner, false))?;
+            }
+            write!(stdout, " │")?;
         }
 
-        // Hint line
+        // Button row (mouse-clickable; Enter/Esc do the same), then the
+        // hint line and the bottom border.
         queue!(
             stdout,
-            MoveTo(0, term_height - 1),
-            SetBackgroundColor(BLACK),
-            SetForegroundColor(GREEN)
+            MoveTo(x0, y0 + 1 + n as u16),
+            SetBackgroundColor(MENU_BG),
+            SetForegroundColor(MENU_FG)
         )?;
-        let hint = " Enter: 実行   Esc: キャンセル ".to_string();
-        let line = pad_to_width(&hint, term_width as usize, false);
-        write!(stdout, "{}", line)?;
+        let ok_w = display_width(BTN_OK);
+        let ca_w = display_width(BTN_CANCEL);
+        let left = inner.saturating_sub(ok_w + BTN_GAP + ca_w) / 2;
+        write!(stdout, "│ {:left$}", "", left = left)?;
+        queue!(stdout, SetBackgroundColor(MENU_SEL_BG), SetForegroundColor(MENU_SEL_FG))?;
+        write!(stdout, "{}", BTN_OK)?;
+        queue!(stdout, SetBackgroundColor(MENU_BG), SetForegroundColor(MENU_FG))?;
+        write!(stdout, "{:gap$}{}", "", BTN_CANCEL, gap = BTN_GAP)?;
+        let used = left + ok_w + BTN_GAP + ca_w;
+        write!(stdout, "{:pad$} │", "", pad = inner.saturating_sub(used))?;
+        queue!(
+            stdout,
+            MoveTo(x0, y0 + 2 + n as u16),
+            SetForegroundColor(DARK_GREY)
+        )?;
+        write!(stdout, "│ {} │", pad_to_width(&Self::dialog_hint(dialog), inner, false))?;
+        queue!(
+            stdout,
+            MoveTo(x0, y0 + 3 + n as u16),
+            SetForegroundColor(MENU_FG)
+        )?;
+        write!(stdout, "└{}┘", "─".repeat(box_w.saturating_sub(2)))?;
         queue!(stdout, ResetColor)?;
         Ok(())
     }
@@ -774,8 +1050,18 @@ impl UI {
                 };
                 let cond_bg = cond.bg_color.map(rgb_to_color);
                 let cond_fg = cond.text_color.map(rgb_to_color);
+                // 負数を赤で表示: overrides the cell's own text color, like
+                // Excel's `[Red]` number formats / l123's negative color.
+                let neg_red_fg = if cell.neg_red && is_number && !is_editing
+                    && (value.starts_with('-')
+                        || (cell.neg_parens && value.starts_with('(')))
+                {
+                    Some(NEG_RED)
+                } else {
+                    None
+                };
                 let user_bg = manual_bg.or(cond_bg);
-                let user_fg = manual_fg.or(cond_fg);
+                let user_fg = neg_red_fg.or(manual_fg).or(cond_fg);
                 let data_bar = cond.data_bar; // (fraction, rgb)
 
                 let (bg, fg) = if is_cursor {
@@ -827,9 +1113,15 @@ impl UI {
                     };
 
                     set_colors(stdout, fg, bg)?;
-                    let bold_active = cell.bold || is_df_header_row;
-                    if bold_active {
+                    let styled = cell.bold || cell.italic || cell.underline || is_df_header_row;
+                    if cell.bold || is_df_header_row {
                         queue!(stdout, SetAttribute(Attribute::Bold))?;
+                    }
+                    if cell.italic {
+                        queue!(stdout, SetAttribute(Attribute::Italic))?;
+                    }
+                    if cell.underline {
+                        queue!(stdout, SetAttribute(Attribute::Underlined))?;
                     }
 
                     // Cell-level alignment overrides the auto right/left
@@ -867,7 +1159,7 @@ impl UI {
                     } else {
                         write!(stdout, "{} ", formatted)?;
                     }
-                    if bold_active {
+                    if styled {
                         queue!(stdout, SetAttribute(Attribute::Reset))?;
                         // Reset attribute also clears colors on some terms;
                         // re-apply so the trailing space stays correct.
@@ -963,6 +1255,11 @@ impl UI {
             }
             _ => {
                 let cell = app.sheet.get_cell(app.cursor_col, app.cursor_row);
+                // l123-style format tag, e.g. (C2) = 通貨 2桁 — shows the
+                // effective format (sheet default included) at a glance.
+                let tag = app.sheet.effective_format(&cell).tag()
+                    .map(|t| format!("({}) ", t))
+                    .unwrap_or_default();
                 let suffix = match &cell.value {
                     CellValue::Formula(_) => {
                         let evaluated = app.evaluate(app.cursor_col, app.cursor_row);
@@ -976,9 +1273,9 @@ impl UI {
                     let end = formula::cell_name(max_c, max_r);
                     let cols = max_c - min_c + 1;
                     let rows = max_r - min_r + 1;
-                    format!(" {} | 選択 {}:{} ({}×{}) | fx: {} ", cell_name, start, end, cols, rows, suffix)
+                    format!(" {} {}| 選択 {}:{} ({}×{}) | fx: {} ", cell_name, tag, start, end, cols, rows, suffix)
                 } else {
-                    format!(" {} | fx: {} ", cell_name, suffix)
+                    format!(" {} {}| fx: {} ", cell_name, tag, suffix)
                 }
             }
         };
@@ -1003,6 +1300,7 @@ impl UI {
             Mode::Menu => "メニュー",
             Mode::Dialog => "入力",
             Mode::ContextMenu => "コンテキスト",
+            Mode::Popup => "書式メニュー",
         };
         let file_str = app.current_file.as_deref()
             .map(|p| std::path::Path::new(p)

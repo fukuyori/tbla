@@ -279,7 +279,8 @@ double-click the cell to start editing.
 - **Insert**: Insert Row/Column, Delete Row/Column
 - **Sheet**: New sheet, Rename, Delete, Next sheet, Previous sheet
 - **Data**: Sort…, Filter…, Clear filter
-- **Format**: Auto-fit / Widen / Narrow / Set column width, Bold toggle, Left/Center/Right align, Text color, Background color, Number format…, Clear formatting, Conditional formatting…
+- **Format**: Cell format…, Auto-fit / Widen / Narrow / Set column width, Bold/Italic/Underline toggle, Left/Center/Right align, Text color, Background color, Number format…, Clear formatting, Conditional formatting…
+- **`:` key**: WYSIWYG format menu (Lotus 1-2-3 style cascading popup) — apply formats with a few mnemonic keystrokes (`:FB` = bold, `:FT3` = red text, `:CA` = auto-fit column)
 - **Help**: Key reference, About
 
 ## Supported Functions
@@ -444,10 +445,16 @@ Applied to the current selection (or the active cell if no selection):
 
 | Action | Effect |
 |--------|--------|
+| Format → Cell format… | One dialog for number format, decimals, alignment, bold and color palettes. Click options, color swatches and the OK/Cancel buttons directly with the mouse; or use `←`/`→` to cycle choices, `Tab`/`↑`/`↓` to move between fields, digit keys to pick decimals. Also on the right-click menu |
 | `Ctrl+B` | Toggle bold |
+| `:` | WYSIWYG format menu — a Lotus 1-2-3 style cascading popup; mnemonic keystrokes apply formats directly (`:FB` bold, `:FI` italic, `:FT3` red text, `:CA` auto-fit column) |
+| Format → Italic / Underline | Toggle italic / underline |
 | Format → Left / Center / Right align | Override the auto numeric-right / text-left default |
-| Format → Text color / Background color | RGB dialog (`255,200,200`, `#fee`, `#ffeedd`; empty input clears) |
-| Format → Number format… | Choose general / number / currency / percent / scientific / date / text + decimals |
+| Format → Text color / Background color | Pick from a palette (8 colors + none) by click or `←`/`→`, or type a custom RGB (`255,200,200`, `#fee`, `#ffeedd`; typed RGB wins over the palette, "なし" clears) |
+| Format → Number format… | Choose general / number / comma / currency / percent / scientific / date / datetime / time / text (`←`/`→`) + decimals |
+| Format → Sheet default format… | Sheet-wide default number format inherited by all General cells (like l123's /Worksheet Global Format) |
+| Negative display | Red / parentheses `(123)` / both — via the cell-format dialog's 負数 row or `:FN` |
+| Format tag | The formula bar shows the current cell's format as an l123-style tag, e.g. `(C2)` = currency 2dp |
 | Format → Clear formatting | Reset alignment, bold, colors, number format to defaults |
 
 Formatting **survives value edits** — replacing `100` with `200` keeps the
@@ -480,13 +487,14 @@ sheet.
   conditional formatting via `ConditionalFormatCell` /
   `ConditionalFormat2ColorScale` so the file opens with the same styling
   in Excel / LibreOffice.
-- **xlsx read**: background color, font color, horizontal alignment, and
-  bold are imported by hand-parsing `xl/styles.xml`. **Conditional
-  formatting is also imported**: `cellIs` comparisons (resolved against
-  `<dxfs>` for colors), `colorScale` (2- or 3-color), and `dataBar`
-  (rendered in tbla as a horizontal bar overlay). Excel files made by
-  others open with colors and conditional rules intact. Borders, italic,
-  underline, font size, and theme/indexed colors are not yet imported.
+- **xlsx read**: background color, font color, horizontal alignment,
+  bold, italic and underline are imported by hand-parsing
+  `xl/styles.xml`. **Conditional formatting is also imported**: `cellIs`
+  comparisons (resolved against `<dxfs>` for colors), `colorScale` (2- or
+  3-color), and `dataBar` (rendered in tbla as a horizontal bar overlay).
+  Excel files made by others open with colors and conditional rules
+  intact. Borders, font size, and theme/indexed colors are not yet
+  imported.
 
 ## Printing
 

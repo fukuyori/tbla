@@ -54,6 +54,20 @@ pub enum Action {
     SheetNext,
     SheetPrev,
 
+    FormatCellDialog,
+    FormatItalicToggle,
+    FormatUnderlineToggle,
+    /// WYSIWYG `:書式 → スタイル解除`: clear bold/italic/underline only
+    /// (l123's `:Format Reset`), leaving colors and number format alone.
+    FormatStyleReset,
+    /// Direct color application from the WYSIWYG palette submenus
+    /// (`None` clears the color).
+    FormatTextColorPick(Option<crate::cell::RgbColor>),
+    FormatBgColorPick(Option<crate::cell::RgbColor>),
+    /// Negative-number display on the selection: (parentheses, red).
+    FormatNegStyle(bool, bool),
+    /// 書式 → シートの既定書式... — sheet-wide default number format.
+    FormatSheetDefault,
     FormatAutoWidth,
     FormatWiderCol,
     FormatNarrowerCol,
@@ -437,6 +451,13 @@ impl MenuBar {
                 mnemonic: 'O',
                 items: vec![
                     SubItem::Item {
+                        label: "セルの書式設定...".to_string(),
+                        mnemonic: Some('E'),
+                        shortcut: None,
+                        action: Action::FormatCellDialog,
+                    },
+                    SubItem::Separator,
+                    SubItem::Item {
                         label: "列幅を自動調整".to_string(),
                         mnemonic: Some('A'),
                         shortcut: None,
@@ -466,6 +487,18 @@ impl MenuBar {
                         mnemonic: Some('B'),
                         shortcut: Some("Ctrl+B"),
                         action: Action::FormatBoldToggle,
+                    },
+                    SubItem::Item {
+                        label: "斜体 切替".to_string(),
+                        mnemonic: Some('I'),
+                        shortcut: None,
+                        action: Action::FormatItalicToggle,
+                    },
+                    SubItem::Item {
+                        label: "下線 切替".to_string(),
+                        mnemonic: Some('V'),
+                        shortcut: None,
+                        action: Action::FormatUnderlineToggle,
                     },
                     SubItem::Item {
                         label: "左揃え".to_string(),
@@ -509,6 +542,12 @@ impl MenuBar {
                         mnemonic: Some('U'),
                         shortcut: None,
                         action: Action::FormatNumber,
+                    },
+                    SubItem::Item {
+                        label: "シートの既定書式...".to_string(),
+                        mnemonic: Some('H'),
+                        shortcut: None,
+                        action: Action::FormatSheetDefault,
                     },
                     SubItem::Item {
                         label: "書式クリア".to_string(),
@@ -764,6 +803,7 @@ impl ContextMenu {
             ("列を削除".to_string(), Action::DeleteCol),
             ("列幅を自動調整".to_string(), Action::FormatAutoWidth),
             ("列幅を変更...".to_string(), Action::FormatSetWidth),
+            ("セルの書式設定...".to_string(), Action::FormatCellDialog),
         ];
 
         let width = items.iter().map(|(s, _)| str_width(s.as_str())).max().unwrap_or(20) + 4;
@@ -818,5 +858,168 @@ impl ContextMenu {
         }
         let idx = r - my - 1;
         self.items.get(idx).map(|(_, a)| *a)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// WYSIWYG (":") popup menu — a nested, cascading popup tree in the spirit of
+// Lotus 1-2-3's WYSIWYG `:Format` menu (via l123). Levels render as boxes
+// cascading to the right; mnemonic letters descend directly.
+
+#[derive(Clone)]
+pub enum PopupEntry {
+    Do(Action),
+    Sub(Vec<PopupItem>),
+}
+
+#[derive(Clone)]
+pub struct PopupItem {
+    pub label: String,
+    pub mnemonic: Option<char>,
+    /// Color chip (■) drawn before the label, for palette entries.
+    /// `Some(None)` = "no color" entry (no chip, but still a palette item).
+    pub swatch: Option<Option<crate::cell::RgbColor>>,
+    pub entry: PopupEntry,
+}
+
+impl PopupItem {
+    pub fn action(label: impl Into<String>, mnemonic: char, action: Action) -> Self {
+        PopupItem { label: label.into(), mnemonic: Some(mnemonic), swatch: None, entry: PopupEntry::Do(action) }
+    }
+
+    pub fn submenu(label: impl Into<String>, mnemonic: char, items: Vec<PopupItem>) -> Self {
+        PopupItem { label: label.into(), mnemonic: Some(mnemonic), swatch: None, entry: PopupEntry::Sub(items) }
+    }
+
+    pub fn color(label: impl Into<String>, mnemonic: char, swatch: Option<crate::cell::RgbColor>, action: Action) -> Self {
+        PopupItem { label: label.into(), mnemonic: Some(mnemonic), swatch: Some(swatch), entry: PopupEntry::Do(action) }
+    }
+
+    pub fn is_submenu(&self) -> bool {
+        matches!(self.entry, PopupEntry::Sub(_))
+    }
+
+    /// Label as rendered: mnemonic appended, "▸"-style marker for submenus
+    /// (ASCII ">" to stay one cell wide in ambiguous-width terminals).
+    pub fn display_label(&self) -> String {
+        let mut s = match self.mnemonic {
+            Some(m) => format!("{}({})", self.label, m),
+            None => self.label.clone(),
+        };
+        if self.is_submenu() {
+            s.push_str(" >");
+        }
+        s
+    }
+}
+
+pub struct PopupLevel {
+    pub items: Vec<PopupItem>,
+    pub selected: usize,
+    pub col: u16,
+    pub row: u16,
+    pub width: usize,
+}
+
+impl PopupLevel {
+    /// Width of the swatch column ("■ " when any item has a chip).
+    fn swatch_cols(items: &[PopupItem]) -> usize {
+        if items.iter().any(|i| i.swatch.is_some()) { 2 } else { 0 }
+    }
+
+    fn new(items: Vec<PopupItem>, col: u16, row: u16, term_w: u16, term_h: u16) -> Self {
+        let sw = Self::swatch_cols(&items);
+        let width = items.iter()
+            .map(|i| str_width(&i.display_label()))
+            .max()
+            .unwrap_or(10) + sw + 4;
+        // Clamp so the box (items + 2 border rows) stays on screen.
+        let mut col = col;
+        let mut row = row;
+        if col as usize + width > term_w as usize {
+            col = (term_w as usize).saturating_sub(width) as u16;
+        }
+        if row as usize + items.len() + 2 > term_h as usize {
+            row = (term_h as usize).saturating_sub(items.len() + 2) as u16;
+        }
+        PopupLevel { items, selected: 0, col, row, width }
+    }
+}
+
+/// What activating the selected popup item produced.
+pub enum PopupOutcome {
+    Action(Action),
+    Descended,
+    None,
+}
+
+pub struct PopupMenu {
+    pub stack: Vec<PopupLevel>,
+}
+
+impl PopupMenu {
+    pub fn open(items: Vec<PopupItem>, col: u16, row: u16, term_w: u16, term_h: u16) -> Self {
+        PopupMenu { stack: vec![PopupLevel::new(items, col, row, term_w, term_h)] }
+    }
+
+    pub fn top_mut(&mut self) -> &mut PopupLevel {
+        self.stack.last_mut().expect("popup stack never empty")
+    }
+
+    pub fn top(&self) -> &PopupLevel {
+        self.stack.last().expect("popup stack never empty")
+    }
+
+    /// Close the deepest level. Returns false when that was the root
+    /// (caller should close the whole popup).
+    pub fn pop(&mut self) -> bool {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Activate the top level's selected item: descend into a submenu
+    /// (cascading right of the parent item) or hand back the action.
+    pub fn activate(&mut self, term_w: u16, term_h: u16) -> PopupOutcome {
+        let top = self.top();
+        let Some(item) = top.items.get(top.selected) else { return PopupOutcome::None; };
+        match item.entry.clone() {
+            PopupEntry::Do(a) => PopupOutcome::Action(a),
+            PopupEntry::Sub(items) => {
+                let col = top.col + top.width as u16;
+                let row = top.row + 1 + top.selected as u16;
+                self.stack.push(PopupLevel::new(items, col, row, term_w, term_h));
+                PopupOutcome::Descended
+            }
+        }
+    }
+
+    /// Mnemonic key: select + activate the matching item of the top level.
+    pub fn activate_mnemonic(&mut self, c: char, term_w: u16, term_h: u16) -> PopupOutcome {
+        let c = c.to_ascii_uppercase();
+        let top = self.top();
+        let Some(idx) = top.items.iter().position(|i| {
+            i.mnemonic.map(|m| m.to_ascii_uppercase()) == Some(c)
+        }) else { return PopupOutcome::None; };
+        self.top_mut().selected = idx;
+        self.activate(term_w, term_h)
+    }
+
+    /// Which level and item a screen position lands on. Checks the deepest
+    /// (topmost-drawn) level first.
+    pub fn hit_test(&self, x: u16, y: u16) -> Option<(usize, usize)> {
+        for (li, lvl) in self.stack.iter().enumerate().rev() {
+            let c = x as usize;
+            let r = y as usize;
+            let mx = lvl.col as usize;
+            let my = lvl.row as usize;
+            if c >= mx && c < mx + lvl.width && r > my && r <= my + lvl.items.len() {
+                return Some((li, r - my - 1));
+            }
+        }
+        None
     }
 }

@@ -80,6 +80,8 @@ pub fn read_xlsx<P: AsRef<Path>>(path: P) -> Result<ReadResult, String> {
                             cell.alignment = st.alignment;
                         }
                         if st.bold { cell.bold = true; }
+                        if st.italic { cell.italic = true; }
+                        if st.underline { cell.underline = true; }
                     }
                 }
                 if let Some(cfs) = styles_wb.sheet_conditionals.get(idx) {
@@ -239,6 +241,8 @@ fn build_format(cell: &Cell) -> Option<Format> {
     }
     let mut f = Format::new();
     if cell.bold { f = f.set_bold(); }
+    if cell.italic { f = f.set_italic(); }
+    if cell.underline { f = f.set_underline(rust_xlsxwriter::FormatUnderline::Single); }
     if let Some(tc) = cell.text_color { f = f.set_font_color(rgb_to_xcolor(tc)); }
     if let Some(bc) = cell.bg_color { f = f.set_background_color(rgb_to_xcolor(bc)); }
     match cell.alignment {
@@ -247,15 +251,40 @@ fn build_format(cell: &Cell) -> Option<Format> {
         Alignment::Right => f = f.set_align(FormatAlign::Right),
         Alignment::Default => {}
     }
-    // Number format
-    f = match &cell.format {
-        DisplayFormat::General => f,
-        DisplayFormat::Number(d) => f.set_num_format(format!("0.{}", "0".repeat(*d))),
-        DisplayFormat::Currency(d) => f.set_num_format(format!("¥#,##0.{}", "0".repeat(*d))),
-        DisplayFormat::Percent(d) => f.set_num_format(format!("0.{}%", "0".repeat(*d))),
-        DisplayFormat::Scientific => f.set_num_format("0.00E+00"),
-        DisplayFormat::Date => f.set_num_format("yyyy-mm-dd"),
-        DisplayFormat::Text => f.set_num_format("@"),
+    // Number format. Numeric kinds get a "positive;negative" pair when the
+    // cell asks for parenthesized / red negatives (Excel's [Red] syntax).
+    let dec = |base: &str, d: &usize| if *d == 0 {
+        base.to_string()
+    } else {
+        format!("{}.{}", base, "0".repeat(*d))
+    };
+    let numeric_base = match &cell.format {
+        DisplayFormat::Number(d) => Some(dec("0", d)),
+        DisplayFormat::Comma(d) => Some(dec("#,##0", d)),
+        DisplayFormat::Currency(d) => Some(format!("¥{}", dec("#,##0", d))),
+        DisplayFormat::Percent(d) => Some(format!("{}%", dec("0", d))),
+        DisplayFormat::Scientific => Some("0.00E+00".to_string()),
+        _ => None,
+    };
+    f = match (&cell.format, numeric_base) {
+        (_, Some(base)) => {
+            if cell.neg_parens || cell.neg_red {
+                let red = if cell.neg_red { "[Red]" } else { "" };
+                let neg = if cell.neg_parens {
+                    format!("{}({})", red, base)
+                } else {
+                    format!("{}-{}", red, base)
+                };
+                f.set_num_format(format!("{};{}", base, neg))
+            } else {
+                f.set_num_format(base)
+            }
+        }
+        (DisplayFormat::Date, _) => f.set_num_format("yyyy-mm-dd"),
+        (DisplayFormat::DateTime, _) => f.set_num_format("yyyy-mm-dd hh:mm"),
+        (DisplayFormat::Time, _) => f.set_num_format("hh:mm:ss"),
+        (DisplayFormat::Text, _) => f.set_num_format("@"),
+        _ => f,
     };
     Some(f)
 }
@@ -435,6 +464,8 @@ mod tests {
             let c = s.cell_format_mut(0, 1);
             c.alignment = crate::cell::Alignment::Right;
             c.bg_color = Some((220, 255, 220));
+            c.italic = true;
+            c.underline = true;
         }
 
         let path = tmp_path("formats_round_trip");
@@ -454,6 +485,8 @@ mod tests {
         let c01 = s2.get_cell(0, 1);
         assert!(matches!(c01.alignment, crate::cell::Alignment::Right));
         assert_eq!(c01.bg_color, Some((220, 255, 220)));
+        assert!(c01.italic, "italic should survive round-trip");
+        assert!(c01.underline, "underline should survive round-trip");
 
         std::fs::remove_file(&path).ok();
     }

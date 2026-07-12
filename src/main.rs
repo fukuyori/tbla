@@ -28,7 +28,7 @@ use std::io::{stdout, Result};
 
 use sheet::Sheet;
 use ui::UI;
-use menu::{MenuBar, MenuState, ContextMenu, Action};
+use menu::{MenuBar, MenuState, ContextMenu, Action, PopupItem, PopupMenu, PopupOutcome};
 
 /// Operation modes
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -38,6 +38,8 @@ pub enum Mode {
     Menu,
     Dialog,
     ContextMenu,
+    /// WYSIWYG (":") cascading format popup — see `wysiwyg_menu_items`.
+    Popup,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -61,6 +63,12 @@ pub enum DialogKind {
     TextColor,
     BgColor,
     NumberFormat,
+    /// 書式 → セルの書式設定: one dialog covering number format, alignment,
+    /// bold and colors. Choice fields are cycled with ←/→, colors are typed.
+    CellFormat,
+    /// 書式 → シートの既定書式: sheet-wide default number format that
+    /// General cells inherit (l123's /Worksheet Global Format).
+    SheetDefaultFormat,
     ConditionalAdd,
     AddComputedColumn,
     OpenCsvAsDf,
@@ -81,10 +89,127 @@ pub enum DialogKind {
     NameManage,
 }
 
+impl DialogKind {
+    /// Title shown in the dialog box frame.
+    pub fn title(&self) -> &'static str {
+        match self {
+            DialogKind::Open => "開く",
+            DialogKind::SaveAs => "名前を付けて保存",
+            DialogKind::ImportCsv => "CSVインポート",
+            DialogKind::ExportCsv => "CSVエクスポート",
+            DialogKind::Find => "検索",
+            DialogKind::Goto => "ジャンプ",
+            DialogKind::SetColWidth => "列幅を変更",
+            DialogKind::PrintHtml => "印刷 (HTML)",
+            DialogKind::Replace => "置換",
+            DialogKind::Sort => "並べ替え",
+            DialogKind::Filter => "フィルター",
+            DialogKind::SheetRename => "シート名変更",
+            DialogKind::TextColor => "文字色",
+            DialogKind::BgColor => "背景色",
+            DialogKind::NumberFormat => "数値書式",
+            DialogKind::CellFormat => "セルの書式設定",
+            DialogKind::SheetDefaultFormat => "シートの既定書式",
+            DialogKind::ConditionalAdd => "条件付き書式",
+            DialogKind::AddComputedColumn => "計算列を追加",
+            DialogKind::OpenCsvAsDf => "CSV を DataFrame として開く",
+            DialogKind::SaveParquet => "Parquet として保存",
+            DialogKind::SqlQuery => "SQL クエリ",
+            DialogKind::GroupBy => "グループ集計",
+            DialogKind::FromUrl => "URLから取り込み",
+            DialogKind::FromUrlPickTable => "取り込むテーブルを選択",
+            DialogKind::FromSql => "SQL から取り込み",
+            DialogKind::NameDefine => "名前付き範囲を定義",
+            DialogKind::NameManage => "名前付き範囲の管理",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct DialogField {
     pub label: String,
     pub input: String,
+    /// Non-empty ⇒ this is a choice field: the user picks `selected` from
+    /// `options` with ←/→/Space, a mouse click, or by typing the option's
+    /// first character. `input` is unused for choice fields.
+    pub options: Vec<String>,
+    pub selected: usize,
+    /// For color-palette choice fields: one color per option (`None` =
+    /// "no color"), rendered as a colored ■ swatch next to the name.
+    pub swatches: Option<Vec<Option<crate::cell::RgbColor>>>,
+}
+
+impl DialogField {
+    pub fn text(label: impl Into<String>, input: impl Into<String>) -> Self {
+        DialogField {
+            label: label.into(),
+            input: input.into(),
+            options: Vec::new(),
+            selected: 0,
+            swatches: None,
+        }
+    }
+
+    pub fn choice(label: impl Into<String>, options: &[&str], selected: usize) -> Self {
+        let selected = selected.min(options.len().saturating_sub(1));
+        DialogField {
+            label: label.into(),
+            input: String::new(),
+            options: options.iter().map(|s| s.to_string()).collect(),
+            selected,
+            swatches: None,
+        }
+    }
+
+    /// Color-palette choice field pre-selected on `current`. If the cell's
+    /// current color isn't in the palette (e.g. imported from xlsx), it is
+    /// appended as a "現在" entry so committing untouched changes nothing.
+    pub fn palette(
+        label: impl Into<String>,
+        palette: &[(&str, Option<crate::cell::RgbColor>)],
+        current: Option<crate::cell::RgbColor>,
+    ) -> Self {
+        let mut options: Vec<String> = palette.iter().map(|(n, _)| n.to_string()).collect();
+        let mut swatches: Vec<Option<crate::cell::RgbColor>> =
+            palette.iter().map(|(_, c)| *c).collect();
+        let selected = match swatches.iter().position(|c| *c == current) {
+            Some(i) => i,
+            None => {
+                options.push("現在".to_string());
+                swatches.push(current);
+                options.len() - 1
+            }
+        };
+        DialogField {
+            label: label.into(),
+            input: String::new(),
+            options,
+            selected,
+            swatches: Some(swatches),
+        }
+    }
+
+    pub fn is_choice(&self) -> bool {
+        !self.options.is_empty()
+    }
+
+    /// Move the selection of a choice field by ±1, wrapping around.
+    pub fn cycle(&mut self, delta: isize) {
+        let n = self.options.len();
+        if n == 0 { return; }
+        self.selected = (self.selected as isize + delta).rem_euclid(n as isize) as usize;
+    }
+
+    /// Select the option matching a typed character (exact option text
+    /// first — so '1' picks "1" not "10" — then prefix match).
+    pub fn select_by_char(&mut self, c: char) {
+        let s = c.to_string();
+        if let Some(i) = self.options.iter().position(|o| **o == s) {
+            self.selected = i;
+        } else if let Some(i) = self.options.iter().position(|o| o.starts_with(c)) {
+            self.selected = i;
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -101,7 +226,7 @@ impl Dialog {
     pub fn single(kind: DialogKind, label: impl Into<String>, input: impl Into<String>) -> Self {
         Dialog {
             kind,
-            fields: vec![DialogField { label: label.into(), input: input.into() }],
+            fields: vec![DialogField::text(label, input)],
             focus: 0,
         }
     }
@@ -156,6 +281,8 @@ pub struct App {
     pub menu_state: MenuState,
     pub dialog: Option<Dialog>,
     pub context_menu: Option<ContextMenu>,
+    /// WYSIWYG (":") popup menu state; Some iff mode == Mode::Popup.
+    pub popup: Option<PopupMenu>,
     pub dragging: bool,
     pub last_click_at: Option<std::time::Instant>,
     pub last_click_cell: Option<(usize, usize)>,
@@ -248,6 +375,7 @@ impl App {
             menu_state: MenuState::default(),
             dialog: None,
             context_menu: None,
+            popup: None,
             dragging: false,
             last_click_at: None,
             last_click_cell: None,
@@ -1381,8 +1509,8 @@ impl App {
                     )
                 };
                 self.dialog = Some(Dialog::multi(DialogKind::NameDefine, vec![
-                    DialogField { label: "名前 (数式・ジャンプで使用)".into(), input: String::new() },
-                    DialogField { label: "範囲 (例: A1:B5)".into(), input: range_text },
+                    DialogField::text("名前 (数式・ジャンプで使用)", String::new()),
+                    DialogField::text("範囲 (例: A1:B5)", range_text),
                 ]));
                 self.mode = Mode::Dialog;
             }
@@ -1400,8 +1528,8 @@ impl App {
             }
             Action::EditReplace => {
                 self.dialog = Some(Dialog::multi(DialogKind::Replace, vec![
-                    DialogField { label: "検索 (find)".into(), input: self.last_search.clone() },
-                    DialogField { label: "置換 (replace)".into(), input: self.last_replace.clone() },
+                    DialogField::text("検索 (find)", self.last_search.clone()),
+                    DialogField::text("置換 (replace)", self.last_replace.clone()),
                 ]));
                 self.mode = Mode::Dialog;
             }
@@ -1446,18 +1574,18 @@ impl App {
             Action::DataSort => {
                 let col = crate::formula::col_to_name(self.cursor_col);
                 self.dialog = Some(Dialog::multi(DialogKind::Sort, vec![
-                    DialogField { label: "並べ替え列 (例: B)".into(), input: col },
-                    DialogField { label: "順序 (asc / desc)".into(), input: "asc".into() },
-                    DialogField { label: "ヘッダー行を含む (y / n)".into(), input: "y".into() },
+                    DialogField::text("並べ替え列 (例: B)", col),
+                    DialogField::text("順序 (asc / desc)", "asc"),
+                    DialogField::text("ヘッダー行を含む (y / n)", "y"),
                 ]));
                 self.mode = Mode::Dialog;
             }
             Action::DataFilter => {
                 let col = crate::formula::col_to_name(self.cursor_col);
                 self.dialog = Some(Dialog::multi(DialogKind::Filter, vec![
-                    DialogField { label: "フィルター対象列 (例: B)".into(), input: col },
-                    DialogField { label: "条件 (例: >100, =\"east\", *abc*)".into(), input: String::new() },
-                    DialogField { label: "ヘッダー行を含む (y / n)".into(), input: "y".into() },
+                    DialogField::text("フィルター対象列 (例: B)", col),
+                    DialogField::text("条件 (例: >100, =\"east\", *abc*)", String::new()),
+                    DialogField::text("ヘッダー行を含む (y / n)", "y"),
                 ]));
                 self.mode = Mode::Dialog;
             }
@@ -1535,8 +1663,8 @@ impl App {
                     self.status_message = "計算列は DataFrame ビューでのみ追加できます（データ → DataFrame ビューに変換）".into();
                 } else {
                     self.dialog = Some(Dialog::multi(DialogKind::AddComputedColumn, vec![
-                        DialogField { label: "列名 (例: revenue)".into(), input: String::new() },
-                        DialogField { label: "式 (例: price * qty)".into(), input: String::new() },
+                        DialogField::text("列名 (例: revenue)", String::new()),
+                        DialogField::text("式 (例: price * qty)", String::new()),
                     ]));
                     self.mode = Mode::Dialog;
                 }
@@ -1558,14 +1686,8 @@ impl App {
                     self.status_message = "グループ集計は DataFrame ビューでのみ使えます".into();
                 } else {
                     self.dialog = Some(Dialog::multi(DialogKind::GroupBy, vec![
-                        DialogField {
-                            label: "グループ列 (カンマ区切り、例: category, region)".into(),
-                            input: String::new(),
-                        },
-                        DialogField {
-                            label: "集計 (col:func、例: amount:sum, score:avg)".into(),
-                            input: String::new(),
-                        },
+                        DialogField::text("グループ列 (カンマ区切り、例: category, region)", String::new()),
+                        DialogField::text("集計 (col:func、例: amount:sum, score:avg)", String::new()),
                     ]));
                     self.mode = Mode::Dialog;
                 }
@@ -1580,18 +1702,9 @@ impl App {
             }
             Action::DataFromSql => {
                 self.dialog = Some(Dialog::multi(DialogKind::FromSql, vec![
-                    DialogField {
-                        label: "接続URI (postgresql:// / mysql:// / sqlite:/// …)".into(),
-                        input: self.last_sql_uri.clone(),
-                    },
-                    DialogField {
-                        label: "SQL クエリ".into(),
-                        input: self.last_sql_query.clone(),
-                    },
-                    DialogField {
-                        label: "取り込み先 (s=新規シート / o=上書き)".into(),
-                        input: "s".into(),
-                    },
+                    DialogField::text("接続URI (postgresql:// / mysql:// / sqlite:/// …)", self.last_sql_uri.clone()),
+                    DialogField::text("SQL クエリ", self.last_sql_query.clone()),
+                    DialogField::text("取り込み先 (s=新規シート / o=上書き)", "s"),
                 ]));
                 self.mode = Mode::Dialog;
             }
@@ -1646,6 +1759,48 @@ impl App {
                 self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.bold = new_bold);
                 self.status_message = if new_bold { "太字 ON".into() } else { "太字 OFF".into() };
             }
+            Action::FormatItalicToggle => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                let new_val = !self.sheet.get_cell(min_c, min_r).italic;
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.italic = new_val);
+                self.status_message = if new_val { "斜体 ON".into() } else { "斜体 OFF".into() };
+            }
+            Action::FormatUnderlineToggle => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                let new_val = !self.sheet.get_cell(min_c, min_r).underline;
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.underline = new_val);
+                self.status_message = if new_val { "下線 ON".into() } else { "下線 OFF".into() };
+            }
+            Action::FormatStyleReset => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| {
+                    c.bold = false;
+                    c.italic = false;
+                    c.underline = false;
+                });
+                self.status_message = "太字/斜体/下線を解除しました".into();
+            }
+            Action::FormatTextColorPick(color) => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.text_color = color);
+                self.status_message = match color {
+                    Some(rgb) => format!("文字色: {:?}", rgb),
+                    None => "文字色をクリア".into(),
+                };
+            }
+            Action::FormatBgColorPick(color) => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.bg_color = color);
+                self.status_message = match color {
+                    Some(rgb) => format!("背景色: {:?}", rgb),
+                    None => "背景色をクリア".into(),
+                };
+            }
             Action::FormatAlignLeft | Action::FormatAlignCenter
             | Action::FormatAlignRight | Action::FormatAlignDefault => {
                 let align = match action {
@@ -1660,25 +1815,72 @@ impl App {
                 self.status_message = format!("揃え: {:?}", align);
             }
             Action::FormatTextColor => {
-                self.dialog = Some(Dialog::single(
-                    DialogKind::TextColor,
-                    "文字色 RGB (例: 255,255,255 または #ffffff、空でクリア)",
-                    String::new(),
-                ));
+                let (min_c, min_r, _, _) = self.get_selection_bounds();
+                let cur = self.sheet.get_cell(min_c, min_r).text_color;
+                self.dialog = Some(Dialog::multi(DialogKind::TextColor, vec![
+                    DialogField::palette("色", &TEXT_COLOR_PALETTE, cur),
+                    DialogField::text("RGB 直接指定 (例: 255,255,255 / #fff、入力時はパレットより優先)", String::new()),
+                ]));
                 self.mode = Mode::Dialog;
             }
             Action::FormatBgColor => {
-                self.dialog = Some(Dialog::single(
-                    DialogKind::BgColor,
-                    "背景色 RGB (例: 255,235,150 または #fff、空でクリア)",
-                    String::new(),
-                ));
+                let (min_c, min_r, _, _) = self.get_selection_bounds();
+                let cur = self.sheet.get_cell(min_c, min_r).bg_color;
+                self.dialog = Some(Dialog::multi(DialogKind::BgColor, vec![
+                    DialogField::palette("色", &BG_COLOR_PALETTE, cur),
+                    DialogField::text("RGB 直接指定 (例: 255,235,150 / #fee、入力時はパレットより優先)", String::new()),
+                ]));
                 self.mode = Mode::Dialog;
             }
             Action::FormatNumber => {
+                let (min_c, min_r, _, _) = self.get_selection_bounds();
+                let (kind_idx, dec) = format_to_choice(&self.sheet.get_cell(min_c, min_r).format);
                 self.dialog = Some(Dialog::multi(DialogKind::NumberFormat, vec![
-                    DialogField { label: "種別 (general/number/currency/percent/scientific/date/text)".into(), input: "number".into() },
-                    DialogField { label: "小数桁数 (0-10)".into(), input: "2".into() },
+                    DialogField::choice("種別", &FORMAT_KIND_OPTIONS, kind_idx),
+                    DialogField::choice("小数桁数", &DECIMALS_OPTIONS, dec),
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::FormatSheetDefault => {
+                let (kind_idx, dec) = format_to_choice(&self.sheet.default_format);
+                self.dialog = Some(Dialog::multi(DialogKind::SheetDefaultFormat, vec![
+                    DialogField::choice("種別", &FORMAT_KIND_OPTIONS, kind_idx),
+                    DialogField::choice("小数桁数", &DECIMALS_OPTIONS, dec),
+                ]));
+                self.mode = Mode::Dialog;
+            }
+            Action::FormatNegStyle(parens, red) => {
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| {
+                    c.neg_parens = parens;
+                    c.neg_red = red;
+                });
+                let idx = neg_to_choice(parens, red);
+                self.status_message = format!("負数の表示: {}", NEG_OPTIONS[idx]);
+            }
+            Action::FormatCellDialog => {
+                // Pre-fill every field from the selection's anchor cell so
+                // committing an untouched dialog is a no-op for uniform ranges.
+                let (min_c, min_r, _, _) = self.get_selection_bounds();
+                let cell = self.sheet.get_cell(min_c, min_r).clone();
+                let (kind_idx, dec) = format_to_choice(&cell.format);
+                let align_idx = match cell.alignment {
+                    crate::cell::Alignment::Default => 0,
+                    crate::cell::Alignment::Left => 1,
+                    crate::cell::Alignment::Center => 2,
+                    crate::cell::Alignment::Right => 3,
+                };
+                self.dialog = Some(Dialog::multi(DialogKind::CellFormat, vec![
+                    DialogField::choice("種別", &FORMAT_KIND_OPTIONS, kind_idx),
+                    DialogField::choice("小数桁数", &DECIMALS_OPTIONS, dec),
+                    DialogField::choice("負数", &NEG_OPTIONS, neg_to_choice(cell.neg_parens, cell.neg_red)),
+                    DialogField::choice("揃え", &ALIGN_OPTIONS, align_idx),
+                    DialogField::choice("太字", &BOLD_OPTIONS, if cell.bold { 1 } else { 0 }),
+                    DialogField::choice("斜体", &BOLD_OPTIONS, if cell.italic { 1 } else { 0 }),
+                    DialogField::choice("下線", &BOLD_OPTIONS, if cell.underline { 1 } else { 0 }),
+                    DialogField::palette("文字色", &TEXT_COLOR_PALETTE, cell.text_color),
+                    DialogField::palette("背景色", &BG_COLOR_PALETTE, cell.bg_color),
                 ]));
                 self.mode = Mode::Dialog;
             }
@@ -1688,6 +1890,10 @@ impl App {
                 self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| {
                     c.alignment = crate::cell::Alignment::Default;
                     c.bold = false;
+                    c.italic = false;
+                    c.underline = false;
+                    c.neg_parens = false;
+                    c.neg_red = false;
                     c.text_color = None;
                     c.bg_color = None;
                     c.format = crate::cell::DisplayFormat::General;
@@ -1702,9 +1908,9 @@ impl App {
                     crate::formula::cell_name(max_c, max_r),
                 );
                 self.dialog = Some(Dialog::multi(DialogKind::ConditionalAdd, vec![
-                    DialogField { label: "対象範囲 (例: A1:B10)".into(), input: range },
-                    DialogField { label: "条件 (例: >100, <=0, =\"NG\", scale:0-100)".into(), input: ">0".into() },
-                    DialogField { label: "背景色 RGB (例: 255,200,200 または #fee)".into(), input: "255,200,200".into() },
+                    DialogField::text("対象範囲 (例: A1:B10)", range),
+                    DialogField::text("条件 (例: >100, <=0, =\"NG\", scale:0-100)", ">0"),
+                    DialogField::text("背景色 RGB (例: 255,200,200 または #fee)", "255,200,200"),
                 ]));
                 self.mode = Mode::Dialog;
             }
@@ -1725,7 +1931,7 @@ impl App {
                 self.mode = Mode::Dialog;
             }
             Action::HelpKeys => {
-                self.status_message = "矢印=移動 / F2=編集 / Ctrl+C/X/V=コピー切取貼付 / Ctrl+Z=戻 / Ctrl+S=保存 / メニュー=「/」か F10 / F4=$切替 / F5=ジャンプ / F9=再計算".to_string();
+                self.status_message = "矢印=移動 / F2=編集 / Ctrl+C/X/V=コピー切取貼付 / Ctrl+Z=戻 / Ctrl+S=保存 / メニュー=「/」か F10 / 書式=「:」 / F4=$切替 / F5=ジャンプ / F9=再計算".to_string();
             }
             Action::HelpAbout => {
                 self.status_message = format!("tbla {} - ターミナル表計算エディタ", env!("CARGO_PKG_VERSION"));
@@ -1868,55 +2074,85 @@ impl App {
                     hidden
                 );
             }
-            DialogKind::TextColor => {
-                let parsed = if input.is_empty() { Some(None) } else { parse_rgb_input(&input).map(Some) };
+            DialogKind::TextColor | DialogKind::BgColor => {
+                // A typed RGB value (field 1) wins over the palette (field 0).
+                let rgb_in = dialog.fields.get(1).map(|f| f.input.trim().to_string()).unwrap_or_default();
+                let parsed: Option<Option<crate::cell::RgbColor>> = if !rgb_in.is_empty() {
+                    parse_rgb_input(&rgb_in).map(Some)
+                } else {
+                    Some(dialog.fields.first()
+                        .and_then(|f| f.swatches.as_ref().and_then(|sw| sw.get(f.selected)).copied())
+                        .flatten())
+                };
+                let is_text = dialog.kind == DialogKind::TextColor;
+                let name = if is_text { "文字色" } else { "背景色" };
                 if let Some(color) = parsed {
                     let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
                     self.save_undo();
-                    self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.text_color = color);
-                    self.status_message = if color.is_some() {
-                        format!("文字色: {:?}", color.unwrap())
-                    } else { "文字色をクリア".into() };
+                    self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| {
+                        if is_text { c.text_color = color; } else { c.bg_color = color; }
+                    });
+                    self.status_message = match color {
+                        Some(rgb) => format!("{}: {:?}", name, rgb),
+                        None => format!("{}をクリア", name),
+                    };
                 } else {
-                    self.status_message = "色の指定が無効です（例: 255,255,255 または #fff）".into();
-                }
-            }
-            DialogKind::BgColor => {
-                let parsed = if input.is_empty() { Some(None) } else { parse_rgb_input(&input).map(Some) };
-                if let Some(color) = parsed {
-                    let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
-                    self.save_undo();
-                    self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.bg_color = color);
-                    self.status_message = if color.is_some() {
-                        format!("背景色: {:?}", color.unwrap())
-                    } else { "背景色をクリア".into() };
-                } else {
-                    self.status_message = "色の指定が無効です（例: 255,235,150 または #fff）".into();
+                    self.status_message = "RGB の指定が無効です（例: 255,200,200 または #fee）".into();
                 }
             }
             DialogKind::NumberFormat => {
-                let kind_in = dialog.fields.get(0).map(|f| f.input.trim().to_lowercase()).unwrap_or_default();
-                let dec_in = dialog.fields.get(1).map(|f| f.input.trim().to_string()).unwrap_or_default();
-                let dec: usize = dec_in.parse().unwrap_or(2).min(10);
-                let fmt = match kind_in.as_str() {
-                    "general" => crate::cell::DisplayFormat::General,
-                    "number" => crate::cell::DisplayFormat::Number(dec),
-                    "currency" => crate::cell::DisplayFormat::Currency(dec),
-                    "percent" | "%" => crate::cell::DisplayFormat::Percent(dec),
-                    "scientific" | "sci" => crate::cell::DisplayFormat::Scientific,
-                    "date" => crate::cell::DisplayFormat::Date,
-                    "text" => crate::cell::DisplayFormat::Text,
-                    _ => {
-                        self.status_message = format!("未知の書式種別: {}", kind_in);
-                        self.dialog = None;
-                        self.mode = Mode::Normal;
-                        return;
-                    }
-                };
+                let kind_idx = dialog.fields.first().map(|f| f.selected).unwrap_or(0);
+                let dec = dialog.fields.get(1).map(|f| f.selected).unwrap_or(2);
+                let fmt = format_from_choice(kind_idx, dec);
                 let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
                 self.save_undo();
                 self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| c.format = fmt.clone());
                 self.status_message = format!("書式: {:?}", fmt);
+            }
+            DialogKind::SheetDefaultFormat => {
+                let kind_idx = dialog.fields.first().map(|f| f.selected).unwrap_or(0);
+                let dec = dialog.fields.get(1).map(|f| f.selected).unwrap_or(2);
+                let fmt = format_from_choice(kind_idx, dec);
+                self.save_undo();
+                self.sheet.default_format = fmt.clone();
+                self.status_message = format!(
+                    "シート {} の既定書式: {:?}（標準のセルに適用）",
+                    self.sheet.name, fmt
+                );
+            }
+            DialogKind::CellFormat => {
+                let get = |i: usize| dialog.fields.get(i).map(|f| f.selected).unwrap_or(0);
+                let fmt = format_from_choice(get(0), get(1));
+                let (neg_parens, neg_red) = neg_from_choice(get(2));
+                let align = match get(3) {
+                    1 => crate::cell::Alignment::Left,
+                    2 => crate::cell::Alignment::Center,
+                    3 => crate::cell::Alignment::Right,
+                    _ => crate::cell::Alignment::Default,
+                };
+                let bold = get(4) == 1;
+                let italic = get(5) == 1;
+                let underline = get(6) == 1;
+                let color_of = |i: usize| -> Option<crate::cell::RgbColor> {
+                    dialog.fields.get(i)
+                        .and_then(|f| f.swatches.as_ref().and_then(|sw| sw.get(f.selected)).copied())
+                        .flatten()
+                };
+                let (text_color, bg_color) = (color_of(7), color_of(8));
+                let (min_c, min_r, max_c, max_r) = self.get_selection_bounds();
+                self.save_undo();
+                self.sheet.apply_format(min_c, min_r, max_c, max_r, |c| {
+                    c.format = fmt.clone();
+                    c.neg_parens = neg_parens;
+                    c.neg_red = neg_red;
+                    c.alignment = align;
+                    c.bold = bold;
+                    c.italic = italic;
+                    c.underline = underline;
+                    c.text_color = text_color;
+                    c.bg_color = bg_color;
+                });
+                self.status_message = "書式を適用しました".into();
             }
             DialogKind::ConditionalAdd => {
                 let range_in = dialog.fields.get(0).map(|f| f.input.trim().to_string()).unwrap_or_default();
@@ -2048,18 +2284,12 @@ impl App {
                                 self.dialog = Some(Dialog::multi(
                                     DialogKind::FromUrlPickTable,
                                     vec![
-                                        DialogField {
-                                            label: format!(
+                                        DialogField::text(format!(
                                                 "テーブル番号 (1-{}) — {}",
                                                 self.pending_url_tables.len(),
                                                 preview_lines.join(" / "),
-                                            ),
-                                            input: "1".into(),
-                                        },
-                                        DialogField {
-                                            label: "取り込み先 (s=新規シート / o=上書き)".into(),
-                                            input: "s".into(),
-                                        },
+                                            ), "1"),
+                                        DialogField::text("取り込み先 (s=新規シート / o=上書き)", "s"),
                                     ],
                                 ));
                                 self.mode = Mode::Dialog;
@@ -2295,6 +2525,149 @@ fn parse_rgb_input(s: &str) -> Option<crate::cell::RgbColor> {
         return Some((r, g, b));
     }
     None
+}
+
+/// Choice labels for `DisplayFormat` kinds, shared by the 数値書式 and
+/// セルの書式設定 dialogs. Order must match `format_from_choice`.
+const FORMAT_KIND_OPTIONS: [&str; 10] =
+    ["標準", "数値", "カンマ", "通貨", "%", "指数", "日付", "日時", "時刻", "文字列"];
+
+/// Negative-number display: (label, neg_parens, neg_red).
+const NEG_OPTIONS: [&str; 4] = ["標準", "赤", "(括弧)", "(括弧)赤"];
+
+fn neg_from_choice(idx: usize) -> (bool, bool) {
+    match idx {
+        1 => (false, true),
+        2 => (true, false),
+        3 => (true, true),
+        _ => (false, false),
+    }
+}
+
+fn neg_to_choice(parens: bool, red: bool) -> usize {
+    match (parens, red) {
+        (false, false) => 0,
+        (false, true) => 1,
+        (true, false) => 2,
+        (true, true) => 3,
+    }
+}
+
+/// Choice labels for decimal places 0-10 (index == value).
+const DECIMALS_OPTIONS: [&str; 11] =
+    ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"];
+
+const ALIGN_OPTIONS: [&str; 4] = ["自動", "左揃え", "中央揃え", "右揃え"];
+const BOLD_OPTIONS: [&str; 2] = ["OFF", "ON"];
+
+/// Color palettes for the セルの書式設定 dialog. Strong tones for text,
+/// pale tones for backgrounds. Custom RGB values are still available via
+/// the standalone 文字色... / 背景色... dialogs.
+const TEXT_COLOR_PALETTE: [(&str, Option<crate::cell::RgbColor>); 9] = [
+    ("なし", None),
+    ("黒", Some((0, 0, 0))),
+    ("白", Some((255, 255, 255))),
+    ("赤", Some((200, 30, 30))),
+    ("青", Some((40, 80, 220))),
+    ("緑", Some((0, 140, 0))),
+    ("橙", Some((255, 136, 0))),
+    ("紫", Some((140, 60, 180))),
+    ("灰", Some((130, 130, 130))),
+];
+const BG_COLOR_PALETTE: [(&str, Option<crate::cell::RgbColor>); 9] = [
+    ("なし", None),
+    ("白", Some((255, 255, 255))),
+    ("赤", Some((255, 200, 200))),
+    ("黄", Some((255, 240, 170))),
+    ("緑", Some((205, 240, 205))),
+    ("青", Some((205, 225, 255))),
+    ("桃", Some((255, 215, 235))),
+    ("水", Some((210, 240, 250))),
+    ("灰", Some((225, 225, 225))),
+];
+
+/// Build the WYSIWYG (":") popup menu tree — tbla's take on Lotus 1-2-3 /
+/// l123's `:Format` WYSIWYG menu: fast keyboard-driven formatting of the
+/// current selection, with the color palettes applied directly (no dialog).
+fn wysiwyg_menu_items() -> Vec<PopupItem> {
+    let color_sub = |palette: &[(&str, Option<crate::cell::RgbColor>)], text: bool| -> Vec<PopupItem> {
+        palette.iter().enumerate().map(|(i, (name, color))| {
+            let mnemonic = char::from_digit(i as u32, 10).unwrap_or(' ');
+            let action = if text {
+                Action::FormatTextColorPick(*color)
+            } else {
+                Action::FormatBgColorPick(*color)
+            };
+            PopupItem::color(format!("{} {}", mnemonic, name), mnemonic, *color, action)
+        }).collect()
+    };
+    vec![
+        PopupItem::submenu("書式", 'F', vec![
+            PopupItem::action("太字 切替", 'B', Action::FormatBoldToggle),
+            PopupItem::action("斜体 切替", 'I', Action::FormatItalicToggle),
+            PopupItem::action("下線 切替", 'U', Action::FormatUnderlineToggle),
+            PopupItem::submenu("文字色", 'T', color_sub(&TEXT_COLOR_PALETTE, true)),
+            PopupItem::submenu("背景色", 'G', color_sub(&BG_COLOR_PALETTE, false)),
+            PopupItem::submenu("揃え", 'A', vec![
+                PopupItem::action("左揃え", 'L', Action::FormatAlignLeft),
+                PopupItem::action("中央揃え", 'C', Action::FormatAlignCenter),
+                PopupItem::action("右揃え", 'R', Action::FormatAlignRight),
+                PopupItem::action("既定に戻す", 'D', Action::FormatAlignDefault),
+            ]),
+            PopupItem::submenu("負数の表示", 'N', vec![
+                PopupItem::action("標準 (-123)", 'S', Action::FormatNegStyle(false, false)),
+                PopupItem::action("赤", 'R', Action::FormatNegStyle(false, true)),
+                PopupItem::action("括弧 (123)", 'P', Action::FormatNegStyle(true, false)),
+                PopupItem::action("括弧+赤", 'B', Action::FormatNegStyle(true, true)),
+            ]),
+            PopupItem::action("スタイル解除 (太字/斜体/下線)", 'R', Action::FormatStyleReset),
+        ]),
+        PopupItem::submenu("列幅", 'C', vec![
+            PopupItem::action("自動調整", 'A', Action::FormatAutoWidth),
+            PopupItem::action("広げる", 'W', Action::FormatWiderCol),
+            PopupItem::action("狭める", 'N', Action::FormatNarrowerCol),
+            PopupItem::action("変更...", 'S', Action::FormatSetWidth),
+        ]),
+        PopupItem::action("セルの書式設定...", 'E', Action::FormatCellDialog),
+        PopupItem::action("数値書式...", 'N', Action::FormatNumber),
+        PopupItem::action("書式クリア", 'X', Action::FormatClear),
+    ]
+}
+
+fn format_from_choice(kind: usize, dec: usize) -> crate::cell::DisplayFormat {
+    use crate::cell::DisplayFormat as F;
+    let dec = dec.min(10);
+    match kind {
+        1 => F::Number(dec),
+        2 => F::Comma(dec),
+        3 => F::Currency(dec),
+        4 => F::Percent(dec),
+        5 => F::Scientific,
+        6 => F::Date,
+        7 => F::DateTime,
+        8 => F::Time,
+        9 => F::Text,
+        _ => F::General,
+    }
+}
+
+/// Inverse of `format_from_choice`: (kind index, decimal places) for
+/// pre-selecting the dialog from a cell's current format. Kinds without
+/// decimals report 2 so switching to 数値/通貨/パーセント starts sensibly.
+fn format_to_choice(fmt: &crate::cell::DisplayFormat) -> (usize, usize) {
+    use crate::cell::DisplayFormat as F;
+    match fmt {
+        F::General => (0, 2),
+        F::Number(d) => (1, (*d).min(10)),
+        F::Comma(d) => (2, (*d).min(10)),
+        F::Currency(d) => (3, (*d).min(10)),
+        F::Percent(d) => (4, (*d).min(10)),
+        F::Scientific => (5, 2),
+        F::Date => (6, 2),
+        F::DateTime => (7, 2),
+        F::Time => (8, 2),
+        F::Text => (9, 2),
+    }
 }
 
 /// Parse a conditional-formatting rule from the dialog inputs. Accepted
@@ -3028,6 +3401,7 @@ fn handle_key(app: &mut App, key: KeyEvent) {
         Mode::Edit => handle_edit_mode(app, key),
         Mode::Menu => handle_menu_mode(app, key),
         Mode::Dialog => handle_dialog_mode(app, key),
+        Mode::Popup => handle_popup_mode(app, key),
         Mode::ContextMenu => handle_context_menu_mode(app, key),
     }
 }
@@ -3175,6 +3549,17 @@ fn handle_normal_mode(app: &mut App, key: KeyEvent) {
                     app.mode = Mode::Menu;
                     app.status_message =
                         "メニュー: 頭文字キーで選択 / Esc で戻る".to_string();
+                    return;
+                }
+                // Lotus 1-2-3 WYSIWYG style: `:` opens the format popup.
+                // A literal leading `:` can still be typed via F2.
+                // '：' covers a Japanese IME left on while hitting the key.
+                if c == ':' || c == '：' {
+                    let (tw, th) = terminal::size().unwrap_or((80, 24));
+                    app.popup = Some(PopupMenu::open(wysiwyg_menu_items(), 1, 1, tw, th));
+                    app.mode = Mode::Popup;
+                    app.status_message =
+                        "書式メニュー: 頭文字キーで選択 / Esc で戻る".to_string();
                     return;
                 }
                 // Any printable char starts edit mode (Excel-style)
@@ -3468,25 +3853,124 @@ fn handle_dialog_mode(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => {
             app.commit_dialog();
         }
-        KeyCode::Tab => {
+        KeyCode::Tab | KeyCode::Down => {
             if let Some(d) = app.dialog.as_mut() {
                 if d.fields.len() > 1 { d.next_field(); }
             }
         }
-        KeyCode::BackTab => {
+        KeyCode::BackTab | KeyCode::Up => {
             if let Some(d) = app.dialog.as_mut() {
                 if d.fields.len() > 1 { d.prev_field(); }
             }
         }
+        KeyCode::Left => {
+            if let Some(d) = app.dialog.as_mut() {
+                let focus = d.focus;
+                d.fields[focus].cycle(-1);
+            }
+        }
+        KeyCode::Right => {
+            if let Some(d) = app.dialog.as_mut() {
+                let focus = d.focus;
+                d.fields[focus].cycle(1);
+            }
+        }
         KeyCode::Backspace => {
             if let Some(d) = app.dialog.as_mut() {
-                d.current_input_mut().pop();
+                let focus = d.focus;
+                if !d.fields[focus].is_choice() {
+                    d.current_input_mut().pop();
+                }
             }
         }
         KeyCode::Char(c) => {
             if !key.modifiers.contains(KeyModifiers::CONTROL) {
                 if let Some(d) = app.dialog.as_mut() {
-                    d.current_input_mut().push(c);
+                    let focus = d.focus;
+                    if d.fields[focus].is_choice() {
+                        // Space cycles; any other char jumps to the option
+                        // starting with it (digits pick decimals directly).
+                        if c == ' ' {
+                            d.fields[focus].cycle(1);
+                        } else {
+                            d.fields[focus].select_by_char(c);
+                        }
+                    } else {
+                        d.current_input_mut().push(c);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Close the WYSIWYG popup and return to READY.
+fn close_popup(app: &mut App) {
+    app.popup = None;
+    app.mode = Mode::Normal;
+}
+
+/// Run the outcome of activating a popup item: execute an action leaf
+/// (closing the popup first) or stay open after descending into a submenu.
+fn apply_popup_outcome(app: &mut App, outcome: PopupOutcome) {
+    if let PopupOutcome::Action(action) = outcome {
+        close_popup(app);
+        app.dispatch(action);
+    }
+}
+
+fn handle_popup_mode(app: &mut App, key: KeyEvent) {
+    let (tw, th) = terminal::size().unwrap_or((80, 24));
+    match key.code {
+        KeyCode::Esc => {
+            if let Some(p) = app.popup.as_mut() {
+                if !p.pop() {
+                    close_popup(app);
+                }
+            }
+        }
+        KeyCode::Up => {
+            if let Some(p) = app.popup.as_mut() {
+                let top = p.top_mut();
+                top.selected = if top.selected == 0 {
+                    top.items.len() - 1
+                } else {
+                    top.selected - 1
+                };
+            }
+        }
+        KeyCode::Down => {
+            if let Some(p) = app.popup.as_mut() {
+                let top = p.top_mut();
+                top.selected = (top.selected + 1) % top.items.len();
+            }
+        }
+        KeyCode::Left => {
+            if let Some(p) = app.popup.as_mut() {
+                p.pop();
+            }
+        }
+        KeyCode::Right => {
+            // Descend only — Right on an action leaf does nothing.
+            if let Some(p) = app.popup.as_mut() {
+                if p.top().items.get(p.top().selected).map(|i| i.is_submenu()).unwrap_or(false) {
+                    let outcome = p.activate(tw, th);
+                    apply_popup_outcome(app, outcome);
+                }
+            }
+        }
+        KeyCode::Enter => {
+            if let Some(p) = app.popup.as_mut() {
+                let outcome = p.activate(tw, th);
+                apply_popup_outcome(app, outcome);
+            }
+        }
+        KeyCode::Char(c) => {
+            if !key.modifiers.contains(KeyModifiers::CONTROL) {
+                if let Some(p) = app.popup.as_mut() {
+                    let outcome = p.activate_mnemonic(c, tw, th);
+                    apply_popup_outcome(app, outcome);
                 }
             }
         }
@@ -3569,8 +4053,64 @@ fn handle_mouse(app: &mut App, mouse: MouseEvent) {
         return;
     }
 
-    // Dialog mode ignores mouse
+    // WYSIWYG popup mode: click activates items (descend or execute);
+    // click outside any level closes the popup.
+    if app.mode == Mode::Popup {
+        if let MouseEventKind::Down(MouseButton::Left) = mouse.kind {
+            let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+            let hit = app.popup.as_ref().and_then(|p| p.hit_test(col, row));
+            match hit {
+                Some((level, item)) => {
+                    if let Some(p) = app.popup.as_mut() {
+                        p.stack.truncate(level + 1);
+                        p.top_mut().selected = item;
+                        let outcome = p.activate(tw, th);
+                        apply_popup_outcome(app, outcome);
+                    }
+                }
+                None => close_popup(app),
+            }
+        }
+        return;
+    }
+
+    // Dialog mode: click selects choice options / focuses text fields /
+    // presses the OK・キャンセル buttons; the wheel cycles choice options.
     if app.mode == Mode::Dialog {
+        let (tw, th) = crossterm::terminal::size().unwrap_or((80, 24));
+        let hit = app.dialog.as_ref().map(|d| UI::dialog_hit_test(d, tw, th, col, row));
+        let Some(hit) = hit else { return; };
+        match mouse.kind {
+            MouseEventKind::Down(MouseButton::Left) => match hit {
+                ui::DialogHit::Option(i, oi) => {
+                    if let Some(d) = app.dialog.as_mut() {
+                        d.focus = i;
+                        d.fields[i].selected = oi;
+                    }
+                }
+                ui::DialogHit::Field(i) => {
+                    if let Some(d) = app.dialog.as_mut() { d.focus = i; }
+                }
+                ui::DialogHit::Ok => app.commit_dialog(),
+                ui::DialogHit::Cancel => {
+                    app.dialog = None;
+                    app.mode = Mode::Normal;
+                }
+                ui::DialogHit::Inside | ui::DialogHit::Outside => {}
+            },
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let delta = if mouse.kind == MouseEventKind::ScrollDown { 1 } else { -1 };
+                if let (Some(d), ui::DialogHit::Option(i, _) | ui::DialogHit::Field(i)) =
+                    (app.dialog.as_mut(), hit)
+                {
+                    if d.fields[i].is_choice() {
+                        d.focus = i;
+                        d.fields[i].cycle(delta);
+                    }
+                }
+            }
+            _ => {}
+        }
         return;
     }
 
